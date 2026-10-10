@@ -195,6 +195,9 @@ def main():
         st.write(f"**Products Indexed:** {index.get_size():,}")
         st.write(f"**Embedding Model:** OpenCLIP ({MODEL_NAME})")
         st.write(f"**Hardware Device:** `{DEVICE.upper()}`")
+        if st.button("🔄 Reload Cache & Index"):
+            st.cache_resource.clear()
+            st.rerun()
 
     # 2. Image Input Section
     col_input, col_display = st.columns([1, 1.2], gap="large")

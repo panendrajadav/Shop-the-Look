@@ -46,6 +46,11 @@ CATEGORY_COMPATIBILITY = {
         "compatible": [],
         "forbidden": ["Footwear", "Pants / Trousers", "Jacket / Outerwear", "Dress", "Skirt", "Top / T-shirt"],
     },
+    "Full Outfit / Look": {
+        "preferred": ["Dress", "Jacket / Outerwear", "Top / T-shirt", "Pants / Trousers"],
+        "compatible": ["Skirt", "Footwear", "Bag / Handbag"],
+        "forbidden": [],
+    },
 }
 
 COLOR_HARMONY = {
@@ -86,7 +91,10 @@ def _generate_scene_crops(image: Image.Image) -> List[Tuple[str, Image.Image]]:
     crops.append(("upper", image.crop((int(w * 0.08), int(h * 0.05), int(w * 0.92), int(h * 0.58)))))
 
     # Lower body
-    crops.append(("lower", image.crop((int(w * 0.10), int(h * 0.45), int(w * 0.90), int(h * 0.95)))))
+    crops.append(("lower", image.crop((int(w * 0.10), int(h * 0.42), int(w * 0.90), int(h * 0.92)))))
+
+    # Footwear (lower base of scene)
+    crops.append(("footwear", image.crop((int(w * 0.12), int(h * 0.78), int(w * 0.88), int(h * 0.99)))))
 
     return crops
 
@@ -310,7 +318,18 @@ class SceneRetrieval:
         garment_proposals = self.garment_detector.extract_garments(scene_image)
         garment_results = []
 
-        for proposal in garment_proposals:
+        # Deduplicate proposals by label to prevent duplicate categories
+        deduped_proposals = []
+        seen_proposal_labels = set()
+        for p in garment_proposals:
+            lbl = p["label"]
+            if lbl not in seen_proposal_labels:
+                seen_proposal_labels.add(lbl)
+                deduped_proposals.append(p)
+
+        global_used_pids = set()
+
+        for proposal in deduped_proposals:
             crop_img = proposal["image"]
             query_cat = proposal["label"]
             query_col = proposal.get("dominant_color", "")
@@ -326,7 +345,7 @@ class SceneRetrieval:
                 continue
 
             # Retrieve candidate pool using category-aware search from catalog_index
-            candidate_pool_size = max(top_k_per_garment * 10, 80)
+            candidate_pool_size = max(top_k_per_garment * 15, 100)
             if hasattr(self.catalog_index, "search_candidates"):
                 raw_candidates = self.catalog_index.search_candidates(
                     crop_emb, target_category=query_cat, candidate_pool_size=candidate_pool_size
@@ -340,7 +359,18 @@ class SceneRetrieval:
             for pid, sim in raw_candidates:
                 if pid not in seen:
                     seen.add(pid)
+                    # If remove_duplicates is enabled, deprioritize products already used in another garment
+                    if remove_duplicates and pid in global_used_pids:
+                        continue
                     deduped_raw.append((pid, sim))
+
+            # If filtering left too few, backfill from raw
+            if len(deduped_raw) < top_k_per_garment:
+                for pid, sim in raw_candidates:
+                    if pid not in [d[0] for d in deduped_raw]:
+                        deduped_raw.append((pid, sim))
+                    if len(deduped_raw) >= top_k_per_garment:
+                        break
 
             # Apply Category, Color, Pattern, and Style Reranking
             reranked = self.rerank_candidates(
@@ -352,7 +382,10 @@ class SceneRetrieval:
                 top_k=top_k_per_garment,
             )
 
-            # Format final recommendations: (pid, raw_sim, rerank_score) tuples with attached rerank metadata
+            # Mark selected pids as used
+            for item in reranked:
+                global_used_pids.add(item[0])
+
             recommendations = [(item[0], item[1], item[2]) for item in reranked]
             diagnostics = [item[3] for item in reranked]
 

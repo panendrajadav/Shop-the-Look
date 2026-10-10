@@ -177,11 +177,13 @@ class EvaluationPipeline:
         image_downloader,
         image_encoder,
         catalog_index,
+        garment_detector=None,
         recalls_at: Optional[List[int]] = None,
     ):
         self.image_downloader = image_downloader
         self.image_encoder = image_encoder
         self.catalog_index = catalog_index
+        self.garment_detector = garment_detector
         self.recalls_at = recalls_at or [1, 5, 10]
         self.evaluator = RetrievalEvaluator(self.recalls_at)
 
@@ -254,7 +256,11 @@ class EvaluationPipeline:
             except Exception:
                 continue
 
-            crops = _generate_scene_crops(scene_image)
+            if self.garment_detector is not None:
+                garment_proposals = self.garment_detector.extract_garments(scene_image)
+                crops = [("full", scene_image)] + [(p["region"], p["image"]) for p in garment_proposals]
+            else:
+                crops = _generate_scene_crops(scene_image)
 
             # 4. Encode all crops and fuse retrieval scores
             product_best_score = {}

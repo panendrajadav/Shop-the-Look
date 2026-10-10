@@ -326,6 +326,7 @@ class RecommendationExplainer:
             norm_p = prod_category.lower()
             category_aligned = (
                 (norm_q in norm_p) or (norm_p in norm_q) or
+                ("outfit" in norm_q) or ("look" in norm_q) or
                 ("jacket" in norm_q and "jacket" in norm_p) or
                 ("top" in norm_q and "top" in norm_p) or
                 ("pants" in norm_q and "pants" in norm_p) or

@@ -52,11 +52,15 @@ def main():
     scene_to_products = val_loader.scene_to_products
 
     # 5. Run evaluation
+    from src.garment_detector import GarmentDetector
+    detector = GarmentDetector(clip_encoder=encoder, use_torchvision_detector=True)
+
     logger.info(f"5. Running evaluation across validation scenes (Recall@Ks: {VALIDATION_RECALL_KS})...")
     pipeline = EvaluationPipeline(
         image_downloader=downloader,
         image_encoder=encoder,
         catalog_index=index,
+        garment_detector=detector,
         recalls_at=VALIDATION_RECALL_KS,
     )
 

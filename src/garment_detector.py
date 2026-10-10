@@ -8,29 +8,27 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 logger = logging.getLogger(__name__)
 
-# Ensembled, curated fashion category prompts
 CATEGORY_TAXONOMY = {
     "Jacket / Outerwear": [
         "a photo of a jacket", "an outerwear coat", "a black jacket", "a blazer",
-        "a lightweight jacket", "a leather jacket", "a denim jacket", "a bomber jacket",
-        "an unzipped jacket", "a casual outerwear jacket", "a winter jacket"
+        "a lightweight jacket", "a leather jacket", "a denim jacket", "a bomber jacket"
     ],
     "Top / T-shirt": [
         "a photo of a shirt or top", "a t-shirt", "a striped shirt or blouse",
-        "a gathered top", "a casual top", "a button-up shirt", "a graphic t-shirt",
-        "a short sleeve blouse", "a cotton top", "a women's top"
+        "a gathered top", "a casual top", "a button-up shirt", "a graphic t-shirt"
     ],
     "Pants / Trousers": [
         "a photo of pants", "a pair of trousers", "denim jeans", "blue jeans",
-        "dark trousers", "black pants", "chinos", "slacks", "sweatpants"
+        "dark trousers", "black pants", "chinos", "slacks", "a person wearing jeans",
+        "a person wearing pants", "a photo of jeans", "denim trousers"
     ],
     "Dress": [
         "a photo of a one-piece dress", "a fashion dress", "a summer dress",
         "an evening gown", "a cocktail dress", "a midi dress", "a full-length dress"
     ],
     "Skirt": [
-        "a photo of a skirt", "a women's skirt", "a pleated skirt", "an a-line skirt",
-        "a mini skirt", "a midi skirt", "a pencil skirt", "a flared skirt"
+        "a photo of a skirt", "a pleated skirt", "an a-line skirt",
+        "a mini skirt", "a midi skirt", "a flared skirt"
     ],
     "Footwear": [
         "a photo of shoes", "a pair of footwear", "sneakers", "leather boots",
@@ -39,13 +37,15 @@ CATEGORY_TAXONOMY = {
     "Bag / Handbag": [
         "a photo of a handbag", "a purse", "a tote bag", "a backpack", "a shoulder bag"
     ],
+    "Full Outfit / Look": [
+        "a fashion outfit", "a complete look", "a stylish outfit", "a full dress outfit"
+    ],
 }
 
-# Strict anatomical candidate subsets to eliminate cross-anatomical misclassifications
 ANATOMICAL_ALLOWED_CATEGORIES = {
     "upper_body": ["Jacket / Outerwear", "Top / T-shirt"],
     "inner_chest": ["Top / T-shirt", "Jacket / Outerwear"],
-    "full_outfit": ["Dress", "Jacket / Outerwear"],
+    "full_outfit": ["Dress", "Full Outfit / Look"],
     "lower_body": ["Pants / Trousers", "Skirt"],
     "footwear": ["Footwear"],
     "general": list(CATEGORY_TAXONOMY.keys()),
@@ -123,10 +123,12 @@ class GarmentDetector:
             logger.info(f"Torchvision detector fallback: {e}")
             self.detection_model = None
 
-    def _detect_persons(self, image: Image.Image) -> List[Tuple[int, int, int, int]]:
-        """Detect person bounding boxes (COCO class 1)."""
+    def _detect_objects(
+        self, image: Image.Image
+    ) -> Tuple[List[Tuple[int, int, int, int]], List[Tuple[Tuple[int, int, int, int], float, str]]]:
+        """Detect person bounding boxes (COCO class 1) and handbag/backpack boxes (classes 31, 27)."""
         if self.detection_model is None:
-            return []
+            return [], []
 
         try:
             w, h = image.size
@@ -140,21 +142,35 @@ class GarmentDetector:
             scores = preds["scores"].cpu().numpy()
 
             person_boxes = []
+            bag_detections = []
             for box, label, score in zip(boxes, labels, scores):
+                x1 = max(0, min(w - 1, int(box[0])))
+                y1 = max(0, min(h - 1, int(box[1])))
+                x2 = max(x1 + 1, min(w, int(box[2])))
+                y2 = max(y1 + 1, min(h, int(box[3])))
+                box_w = x2 - x1
+                box_h = y2 - y1
+
                 if label == 1 and score > 0.35:
-                    x1 = max(0, min(w - 1, int(box[0])))
-                    y1 = max(0, min(h - 1, int(box[1])))
-                    x2 = max(x1 + 1, min(w, int(box[2])))
-                    y2 = max(y1 + 1, min(h, int(box[3])))
-                    if (x2 - x1) > 40 and (y2 - y1) > 80:
+                    if box_w > 40 and box_h > 80:
                         person_boxes.append((x1, y1, x2, y2))
+                elif label in (31, 27) and score > 0.25:  # handbag or backpack
+                    if box_w > 18 and box_h > 18:
+                        bag_detections.append(((x1, y1, x2, y2), float(score), "Bag / Handbag"))
 
             # Largest person first
             person_boxes.sort(key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
-            return person_boxes
+            # Highest confidence bag first
+            bag_detections.sort(key=lambda b: b[1], reverse=True)
+            return person_boxes, bag_detections
         except Exception as e:
-            logger.debug(f"Person detection error: {e}")
-            return []
+            logger.debug(f"Object detection error: {e}")
+            return [], []
+
+    def _detect_persons(self, image: Image.Image) -> List[Tuple[int, int, int, int]]:
+        """Detect person bounding boxes (COCO class 1) for backward compatibility."""
+        persons, _ = self._detect_objects(image)
+        return persons
 
     def classify_crop(
         self, crop_image: Image.Image, candidate_categories: Optional[List[str]] = None
@@ -272,55 +288,72 @@ class GarmentDetector:
             return "Neutral"
 
     def extract_garments(self, scene_image: Image.Image) -> List[Dict]:
-        """Extract anatomically grounded garment proposals from scene image.
-
-        Specifically designed to support layered outfits (e.g. jacket over t-shirt)
-        without misclassifying jackets/t-shirts as skirts or boots. Handles waist-up
-        and full-body images with adaptive visibility detection.
-        """
-        # Apply EXIF rotation correction
+        """Extract garment proposals from scene image, checking the whole image and isolated items."""
         scene_image = ImageOps.exif_transpose(scene_image) or scene_image
         w, h = scene_image.size
         crops = []
 
-        person_boxes = self._detect_persons(scene_image)
+        # 1. Check if the scene / outfit is a one-piece dress
+        is_dress, dress_conf = self.is_dress_outfit(scene_image)
+        dress_proposal = None
+        if is_dress and dress_conf >= 0.58:
+            dress_proposal = {
+                "region": "Full Image",
+                "label": "Dress",
+                "box": (0, 0, w, h),
+                "image": scene_image,
+                "confidence": dress_conf,
+                "dominant_color": self.extract_color(scene_image),
+                "icon": "👗",
+                "is_uncertain": False,
+            }
+
+        person_boxes, bag_detections = self._detect_objects(scene_image)
 
         if person_boxes:
             px1, py1, px2, py2 = person_boxes[0]
             pw = px2 - px1
             ph = py2 - py1
             person_ar = ph / max(1, pw)
-            is_truncated_bottom = (py2 >= int(h * 0.95))
 
-            # Trousers are only sufficiently visible if person box has sufficient vertical span
-            # and is not cropped strictly waist-up
-            trousers_sufficiently_visible = (person_ar >= 1.70)
-            # Footwear is only visible if person box spans full height and reaches near floor
-            footwear_sufficiently_visible = (person_ar >= 2.30) and not is_truncated_bottom
+            trousers_sufficiently_visible = (person_ar >= 1.25)
+            footwear_sufficiently_visible = (py2 >= int(h * 0.70)) and (person_ar >= 1.20)
 
-            # 1. Check if the outfit is a continuous Dress
-            full_outfit_box = (
-                max(0, px1 - int(pw * 0.05)),
-                max(0, int(py1 + 0.10 * ph)),
-                min(w, px2 + int(pw * 0.05)),
-                min(h, int(py1 + 0.88 * ph))
-            )
-            outfit_crop = scene_image.crop(full_outfit_box)
-            is_dress, dress_conf = self.is_dress_outfit(outfit_crop)
+            # Check if isolated person region is a one-piece dress
+            if not dress_proposal:
+                full_outfit_box = (
+                    max(0, px1 - int(pw * 0.05)),
+                    max(0, int(py1 + 0.08 * ph)),
+                    min(w, px2 + int(pw * 0.05)),
+                    min(h, int(py1 + 0.90 * ph))
+                )
+                outfit_crop = scene_image.crop(full_outfit_box)
+                person_is_dress, person_dress_conf = self.is_dress_outfit(outfit_crop)
+                if person_is_dress and person_dress_conf >= 0.65:
+                    dress_proposal = {
+                        "region": "Full Outfit",
+                        "label": "Dress",
+                        "box": full_outfit_box,
+                        "image": outfit_crop,
+                        "confidence": person_dress_conf,
+                        "dominant_color": self.extract_color(outfit_crop),
+                        "icon": "👗",
+                        "is_uncertain": False,
+                    }
 
-            if is_dress and dress_conf > 0.72 and trousers_sufficiently_visible:
+            if dress_proposal:
+                crops.append(dress_proposal)
+            else:
                 crops.append({
-                    "region": "Main Outfit",
-                    "label": "Dress",
-                    "box": full_outfit_box,
-                    "image": outfit_crop,
-                    "confidence": dress_conf,
-                    "dominant_color": self.extract_color(outfit_crop),
-                    "icon": "👗",
+                    "region": "Full Image",
+                    "label": "Full Outfit / Look",
+                    "box": (0, 0, w, h),
+                    "image": scene_image,
+                    "confidence": 0.90,
+                    "dominant_color": self.extract_color(scene_image),
+                    "icon": "✨",
                     "is_uncertain": False,
                 })
-            else:
-                # 2. Upper Body Extraction (Jacket vs Shirt/Top):
                 upper_span = 0.58 if trousers_sufficiently_visible else 0.88
                 jacket_box = (
                     max(0, px1 - int(pw * 0.05)),
@@ -335,7 +368,6 @@ class GarmentDetector:
                         jacket_crop, ANATOMICAL_ALLOWED_CATEGORIES["upper_body"]
                     )
                     jacket_color = self.extract_color(jacket_crop)
-
                     is_jacket = ("Jacket" in jacket_label)
                     crops.append({
                         "region": "Upper Outerwear" if is_jacket else "Shirt / Top",
@@ -348,7 +380,6 @@ class GarmentDetector:
                         "is_uncertain": jacket_conf < 0.45,
                     })
 
-                # B: Inner Torso Top - only if outer garment is a jacket (layered outfit)
                 if jacket_label == "Jacket / Outerwear":
                     tshirt_box = (
                         max(0, int(px1 + 0.15 * pw)),
@@ -358,49 +389,48 @@ class GarmentDetector:
                     )
                     if (tshirt_box[2] - tshirt_box[0] > 25) and (tshirt_box[3] - tshirt_box[1] > 25):
                         tshirt_crop = scene_image.crop(tshirt_box)
-                        tshirt_color = self.extract_color(tshirt_crop)
-
                         crops.append({
                             "region": "Inner Torso",
                             "label": "Top / T-shirt",
                             "box": tshirt_box,
                             "image": tshirt_crop,
                             "confidence": 0.88,
-                            "dominant_color": tshirt_color,
+                            "dominant_color": self.extract_color(tshirt_crop),
                             "icon": "👕",
                             "is_uncertain": False,
                         })
 
-                # C: Lower Body (Pants / Trousers / Skirt)
-                if person_ar >= 1.35:
+                # Lower body: strict Skirt confidence threshold to prevent pants misclassification
+                if person_ar >= 1.25:
                     lower_box = (
                         max(0, px1),
-                        max(0, int(py1 + 0.45 * ph)),
+                        max(0, int(py1 + 0.40 * ph)),
                         min(w, px2),
-                        min(h, int(py1 + (0.92 * ph if person_ar >= 1.70 else 0.84 * ph)))
+                        min(h, int(py1 + (0.92 * ph if person_ar >= 1.55 else 0.86 * ph)))
                     )
                     if (lower_box[3] - lower_box[1]) > 35:
                         lower_crop = scene_image.crop(lower_box)
                         lower_label, lower_conf = self.classify_crop(
                             lower_crop, ANATOMICAL_ALLOWED_CATEGORIES["lower_body"]
                         )
-                        if lower_label == "Skirt":
+                        is_skirt = (lower_label == "Skirt" and lower_conf >= 0.82)
+                        if is_skirt:
                             skirt_box = (
                                 max(0, px1),
-                                max(0, int(py1 + 0.42 * ph)),
+                                max(0, int(py1 + 0.40 * ph)),
                                 min(w, px2),
                                 min(h, int(py1 + 0.78 * ph))
                             )
                             skirt_crop = scene_image.crop(skirt_box)
                             crops.append({
-                                "region": "Lower Body (Skirt)",
+                                "region": "Lower Body",
                                 "label": "Skirt",
                                 "box": skirt_box,
                                 "image": skirt_crop,
                                 "confidence": lower_conf,
                                 "dominant_color": self.extract_color(skirt_crop),
                                 "icon": "👗",
-                                "is_uncertain": lower_conf < 0.45,
+                                "is_uncertain": False,
                             })
                         elif trousers_sufficiently_visible:
                             crops.append({
@@ -408,24 +438,23 @@ class GarmentDetector:
                                 "label": "Pants / Trousers",
                                 "box": lower_box,
                                 "image": lower_crop,
-                                "confidence": lower_conf,
+                                "confidence": lower_conf if lower_label == "Pants / Trousers" else (1.0 - lower_conf),
                                 "dominant_color": self.extract_color(lower_crop),
                                 "icon": "👖",
-                                "is_uncertain": lower_conf < 0.45,
+                                "is_uncertain": False,
                             })
 
-            # D: Footwear (Shoes / Boots) - only if bottom region is genuine footwear
             if footwear_sufficiently_visible:
                 shoes_box = (
                     max(0, px1),
-                    max(0, int(py1 + 0.84 * ph)),
+                    max(0, int(py1 + 0.82 * ph)),
                     min(w, px2),
-                    min(h, py2)
+                    min(h, int(py2 + 0.05 * ph))
                 )
-                if (shoes_box[3] - shoes_box[1]) > 25:
+                if (shoes_box[3] - shoes_box[1]) > 18 and (shoes_box[2] - shoes_box[0]) > 20:
                     shoe_crop = scene_image.crop(shoes_box)
                     shoe_label, shoe_conf = self.classify_crop(shoe_crop, ["Footwear", "Pants / Trousers"])
-                    if shoe_label == "Footwear" and shoe_conf > 0.50:
+                    if shoe_label == "Footwear" or shoe_conf >= 0.38:
                         crops.append({
                             "region": "Footwear",
                             "label": "Footwear",
@@ -438,9 +467,7 @@ class GarmentDetector:
                         })
 
         else:
-            # Fallback anatomical proposals across the scene
             scene_ar = h / max(1, w)
-
             upper_box = (int(0.08 * w), int(0.06 * h), int(0.92 * w), int(0.58 * h))
             upper_crop = scene_image.crop(upper_box)
             upper_label, upper_conf = self.classify_crop(upper_crop, ["Jacket / Outerwear", "Top / T-shirt"])
@@ -453,10 +480,9 @@ class GarmentDetector:
                 "confidence": upper_conf,
                 "dominant_color": self.extract_color(upper_crop),
                 "icon": "🧥" if is_jacket else "👚",
-                "is_uncertain": upper_conf < 0.45,
+                "is_uncertain": False,
             })
 
-            # Inner torso only if outerwear jacket was detected
             if is_jacket:
                 inner_box = (int(0.22 * w), int(0.12 * h), int(0.78 * w), int(0.48 * h))
                 inner_crop = scene_image.crop(inner_box)
@@ -471,24 +497,46 @@ class GarmentDetector:
                     "is_uncertain": False,
                 })
 
-            # Lower body only if image aspect ratio indicates vertical full/half outfit
-            if scene_ar >= 1.30:
-                lower_box = (int(0.12 * w), int(0.50 * h), int(0.88 * w), int(0.92 * h))
+            if scene_ar >= 1.25:
+                lower_box = (int(0.12 * w), int(0.45 * h), int(0.88 * w), int(0.92 * h))
                 lower_crop = scene_image.crop(lower_box)
                 lower_label, lower_conf = self.classify_crop(lower_crop, ["Pants / Trousers", "Skirt"])
-                is_skirt = (lower_label == "Skirt")
+                is_skirt = (lower_label == "Skirt" and lower_conf >= 0.82)
                 crops.append({
-                    "region": "Lower Region (Skirt)" if is_skirt else "Lower Region",
-                    "label": lower_label,
+                    "region": "Lower Region",
+                    "label": "Skirt" if is_skirt else "Pants / Trousers",
                     "box": lower_box,
                     "image": lower_crop,
                     "confidence": lower_conf,
                     "dominant_color": self.extract_color(lower_crop),
                     "icon": "👗" if is_skirt else "👖",
-                    "is_uncertain": lower_conf < 0.45,
+                    "is_uncertain": False,
                 })
 
+        # E: Detected Handbags / Bags from COCO detector
+        for bag_box, bag_score, bag_label in bag_detections[:2]:
+            bx1, by1, bx2, by2 = bag_box
+            pad = 6
+            padded_box = (
+                max(0, bx1 - pad),
+                max(0, by1 - pad),
+                min(w, bx2 + pad),
+                min(h, by2 + pad),
+            )
+            bag_crop = scene_image.crop(padded_box)
+            crops.append({
+                "region": "Handbag / Accessory",
+                "label": "Bag / Handbag",
+                "box": padded_box,
+                "image": bag_crop,
+                "confidence": bag_score,
+                "dominant_color": self.extract_color(bag_crop),
+                "icon": "👜",
+                "is_uncertain": False,
+            })
+
         return crops
+
 
     def draw_detections(self, image: Image.Image, detections: List[Dict]) -> Image.Image:
         """Annotate image with sleek colored bounding boxes and badges."""
