@@ -42,7 +42,6 @@ CATEGORY_TAXONOMY = {
     ],
 }
 
-# Specific item names within each category (name, CLIP prompt)
 ITEM_NAMES = {
     "Jacket / Outerwear": [
         ("Blazer", "a blazer"), ("Denim Jacket", "a denim jacket"), ("Leather Jacket", "a leather jacket"),
@@ -81,7 +80,6 @@ ITEM_NAMES = {
     ],
 }
 
-# Same pattern vocabulary as the catalog metadata (scripts/enrich_catalog_metadata.py)
 PATTERN_PROMPTS = {
     "Solid Color": "a photo of solid single color plain fabric",
     "Graphic / Printed": "a photo of graphic printed or logo fabric",
@@ -141,7 +139,6 @@ class GarmentDetector:
                     cat_embs.append(mean_e)
             self.category_embeddings = torch.stack(cat_embs)
 
-            # Dress vs Two-Piece discriminants
             d_toks = tokenizer(["a photo of a one-piece dress", "a woman wearing a dress"]).to(self.device)
             s_toks = tokenizer(["a photo of a jacket and shirt", "a person wearing a top and pants"]).to(self.device)
             with torch.no_grad():
@@ -233,13 +230,11 @@ class GarmentDetector:
                 if label == 1 and score > 0.35:
                     if box_w > 40 and box_h > 80:
                         person_boxes.append((x1, y1, x2, y2))
-                elif label in (31, 27) and score > 0.25:  # handbag or backpack (CLIP-verified later)
+                elif label in (31, 27) and score > 0.25:
                     if box_w > 18 and box_h > 18:
                         bag_detections.append(((x1, y1, x2, y2), float(score), "Bag / Handbag"))
 
-            # Largest person first
             person_boxes.sort(key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
-            # Highest confidence bag first
             bag_detections.sort(key=lambda b: b[1], reverse=True)
             return person_boxes, bag_detections
         except Exception as e:
@@ -289,7 +284,6 @@ class GarmentDetector:
             return category
         return ITEM_NAMES[category][int(np.argmax(embs @ crop_embedding))][0]
 
-    # Categories that can legitimately be seen in the same body region
     VERIFY_GROUPS = [
         {"Jacket / Outerwear", "Top / T-shirt", "Dress"},
         {"Pants / Trousers", "Skirt", "Dress"},
@@ -362,7 +356,7 @@ class GarmentDetector:
                 s_sim = (f @ self.separates_feat.unsqueeze(-1))[0, 0].item()
 
                 probs = torch.softmax(torch.tensor([d_sim, s_sim]) * 20.0, dim=-1)
-                is_dress = d_sim > (s_sim + 0.03)  # Requires genuine dress margin
+                is_dress = d_sim > (s_sim + 0.03)
                 return (bool(is_dress), float(probs[0] if is_dress else probs[1]))
         except Exception:
             return (False, 0.5)
@@ -374,7 +368,6 @@ class GarmentDetector:
             arr = np.array(crop_rgb)
             h, w, _ = arr.shape
 
-            # Sample border pixels (outer 5%) to estimate backdrop/ambient color
             borders = np.concatenate([
                 arr[:4, :].reshape(-1, 3),
                 arr[-4:, :].reshape(-1, 3),
@@ -386,12 +379,10 @@ class GarmentDetector:
             pixels = arr.reshape(-1, 3).astype(float)
             dist_to_bg = np.linalg.norm(pixels - bg_color, axis=1)
 
-            # Central 60% coordinates
             cx1, cx2 = int(w * 0.20), int(w * 0.80)
             cy1, cy2 = int(h * 0.20), int(h * 0.80)
             center_pixels = arr[cy1:cy2, cx1:cx2].reshape(-1, 3)
 
-            # Filter background if distinct
             is_bg = (dist_to_bg < 32) | (
                 (pixels[:, 0] > 230) & (pixels[:, 1] > 230) & (pixels[:, 2] > 230) & (np.ptp(pixels, axis=1) < 18)
             )
@@ -437,8 +428,6 @@ class GarmentDetector:
         w, h = scene_image.size
         crops = []
 
-        # A dress is judged on the detected person, not on the whole photo: backgrounds such
-        # as flowers or curtains make whole-image dress checks fire on scenes with no dress.
         dress_proposal = None
 
         person_boxes, bag_detections = self._detect_objects(scene_image)
@@ -452,7 +441,6 @@ class GarmentDetector:
             trousers_sufficiently_visible = (person_ar >= 1.25)
             footwear_sufficiently_visible = (py2 >= int(h * 0.70)) and (person_ar >= 1.20)
 
-            # Check if isolated person region is a one-piece dress
             if not dress_proposal:
                 full_outfit_box = (
                     max(0, px1 - int(pw * 0.05)),
@@ -487,8 +475,6 @@ class GarmentDetector:
                     "icon": "✨",
                     "is_uncertain": False,
                 })
-                # Regions are kept apart so each crop holds one garment: the upper layer ends at the
-                # waist (about half of a standing figure) and the lower body starts just below it.
                 upper_span = 0.52 if trousers_sufficiently_visible else 0.88
                 jacket_box = (
                     max(0, px1 - int(pw * 0.05)),
@@ -516,7 +502,6 @@ class GarmentDetector:
                     })
 
                 if jacket_label == "Jacket / Outerwear":
-                    # Inner shirt: the centre of the chest only, away from jacket fronts and sleeves
                     tshirt_box = (
                         max(0, int(px1 + 0.30 * pw)),
                         max(0, int(py1 + 0.16 * ph)),
@@ -536,9 +521,7 @@ class GarmentDetector:
                             "is_uncertain": False,
                         })
 
-                # Lower body: strict Skirt confidence threshold to prevent pants misclassification
                 if person_ar >= 1.25:
-                    # Legs sit inside the person box, whose width is set by arms and bags
                     lower_box = (
                         max(0, int(px1 + 0.08 * pw)),
                         max(0, int(py1 + 0.47 * ph)),
@@ -581,7 +564,6 @@ class GarmentDetector:
                                 "is_uncertain": False,
                             })
 
-            # Sunglasses: zero-shot check on the head region of the person box
             head_box = (max(0, px1), max(0, py1), min(w, px2), min(h, int(py1 + 0.17 * ph)))
             if (head_box[2] - head_box[0]) > 24 and (head_box[3] - head_box[1]) > 24:
                 head_crop = scene_image.crop(head_box)
@@ -622,8 +604,6 @@ class GarmentDetector:
                         })
 
         else:
-            # No person found: the photo shows an item on its own (a product shot or close-up),
-            # so the whole image is one query, classified across all item categories.
             item_cats = [c for c in self.category_names if c != "Full Outfit / Look"]
             item_label, item_conf = self.classify_crop(scene_image, item_cats)
             crops.append({
@@ -637,7 +617,6 @@ class GarmentDetector:
                 "is_uncertain": item_conf < 0.45,
             })
 
-        # E: Detected Handbags / Bags from COCO detector
         for bag_box, bag_score, bag_label in bag_detections[:2]:
             bx1, by1, bx2, by2 = bag_box
             pad = 6
@@ -659,15 +638,12 @@ class GarmentDetector:
                 "is_uncertain": False,
             })
 
-        # Keep only regions that really show the proposed garment
         verified = [
             c for c in crops
             if c["label"] in ("Full Outfit / Look", "Accessory") or c["region"] == "Full Image"
             or self.verify_crop(c["image"], c["label"])
         ]
         if not any(c["label"] != "Full Outfit / Look" for c in verified):
-            # Nothing on the "person" held up (often a false person detection on a close-up):
-            # treat the photo as a single item instead.
             item_cats = [c for c in self.category_names if c != "Full Outfit / Look"]
             item_label, item_conf = self.classify_crop(scene_image, item_cats)
             return [{
@@ -691,13 +667,13 @@ class GarmentDetector:
         w, h = annotated.size
 
         palette = {
-            "Jacket / Outerwear": "#2563eb",  # Royal Blue
-            "Top / T-shirt": "#0284c7",       # Sky Blue
-            "Pants / Trousers": "#7c3aed",   # Purple
-            "Dress": "#059669",              # Emerald Green
-            "Skirt": "#db2777",              # Pink
-            "Footwear": "#d97706",           # Amber
-            "Bag / Handbag": "#475569",      # Slate
+            "Jacket / Outerwear": "#2563eb",
+            "Top / T-shirt": "#0284c7",
+            "Pants / Trousers": "#7c3aed",
+            "Dress": "#059669",
+            "Skirt": "#db2777",
+            "Footwear": "#d97706",
+            "Bag / Handbag": "#475569",
         }
 
         for det in detections:
@@ -707,7 +683,7 @@ class GarmentDetector:
 
             category = det.get("label") or det.get("garment_label", "Item")
             if category == "Full Outfit / Look":
-                continue  # the whole-photo query is not an item; drawing it only adds clutter
+                continue
             label = det.get("item_name") or category
             conf = det.get("confidence", 0.0)
             color_name = det.get("dominant_color", "")
@@ -720,8 +696,7 @@ class GarmentDetector:
             for offset in range(3):
                 draw.rectangle([x1 - offset, y1 - offset, x2 + offset, y2 + offset], outline=border_color)
 
-            # Badge with Icon, Label, and Detected Color
-            text = label  # the default PIL font cannot render emoji
+            text = label
             if color_name and color_name != "Neutral":
                 text += f" ({color_name})"
             text += f" {conf:.0%}"

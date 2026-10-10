@@ -16,7 +16,6 @@ import numpy as np
 import torch
 from PIL import Image
 
-# Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import (
@@ -48,14 +47,12 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # 1. Load catalog (the only source of indexable product IDs)
     catalog_loader = ProductCatalogLoader(PRODUCT_CATALOG_FILE)
     catalog_loader.load()
     catalog_ids = sorted(catalog_loader.get_unique_products())
     catalog_set = set(catalog_ids)
     logger.info(f"Catalog records: {len(catalog_loader.products)} | unique product IDs: {len(catalog_ids)}")
 
-    # 2. Reuse embeddings from a previous run (catalog products only)
     product_embeddings = {}
     product_metadata = {}
     if PRODUCTS_EMBEDDINGS_FILE.exists() and PRODUCTS_METADATA_FILE.exists():
@@ -76,7 +73,6 @@ def main():
     if args.limit:
         target_products = target_products[:args.limit]
 
-    # 3. Resolve images (download unless --cached-only)
     downloader = ImageDownloader(IMAGES_DIR, max_workers=args.workers)
     if args.cached_only:
         image_paths = {}
@@ -93,7 +89,6 @@ def main():
         logger.info(f"Download statistics: {downloader.get_stats()}")
     logger.info(f"Catalog images available locally: {len(image_paths)} / {len(target_products)}")
 
-    # 4. Encode images not yet embedded
     to_encode = [(pid, Path(image_paths[pid])) for pid in target_products
                  if pid in image_paths and pid not in product_embeddings]
     logger.info(f"New product images to encode: {len(to_encode)} with OpenCLIP {MODEL_NAME} on {DEVICE}")
@@ -130,18 +125,14 @@ def main():
                 rate = (i + len(batch)) / max(1e-6, time.time() - start)
                 logger.info(f"  Encoded {i + len(batch)}/{len(to_encode)} ({rate:.1f} img/s)")
 
-    # 5. Build FAISS index and persist
     index = ProductIndex(PRODUCTS_EMBEDDINGS_FILE, PRODUCTS_METADATA_FILE, PRODUCTS_INDEX_FILE)
     num_indexed = index.build_index(product_embeddings, product_metadata)
     index.save()
 
-    # 6. Category / pattern / colour attributes for every indexed product
     enrich_catalog()
 
-    # 7. Garment-level views for products photographed on a model
     build_product_views()
 
-    # 8. Query-domain mean for domain centring (scene images only, no labels)
     build_query_stats()
 
     assert set(index.product_ids) <= catalog_set, "Index contains a non-catalog product"

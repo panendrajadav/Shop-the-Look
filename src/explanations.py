@@ -100,7 +100,6 @@ class AttributeExtractor:
             arr = np.array(im_rgb)
             h, w, _ = arr.shape
 
-            # Sample border pixels (outer 5%) to estimate background color
             borders = np.concatenate([
                 arr[:5, :].reshape(-1, 3),
                 arr[-5:, :].reshape(-1, 3),
@@ -112,12 +111,10 @@ class AttributeExtractor:
             pixels = arr.reshape(-1, 3).astype(float)
             dist_to_bg = np.linalg.norm(pixels - bg_color, axis=1)
 
-            # Is pixel close to background OR neutral bright white (common catalog artifact)?
             is_bg = (dist_to_bg < 32) | (
                 (pixels[:, 0] > 230) & (pixels[:, 1] > 230) & (pixels[:, 2] > 230) & (np.ptp(pixels, axis=1) < 18)
             )
 
-            # If background removal leaves too few pixels, fall back to center crop
             if is_bg.sum() > 0.90 * len(pixels):
                 fg_pixels = arr[int(h * 0.20):int(h * 0.80), int(w * 0.20):int(w * 0.80)].reshape(-1, 3)
             else:
@@ -132,7 +129,6 @@ class AttributeExtractor:
             h_norm, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
             h_deg = h_norm * 360.0
 
-            # 1. Low saturation or extreme value checks
             if v < 0.24 or (v < 0.36 and s < 0.22):
                 return "Black"
             if v > 0.86 and s < 0.14:
@@ -140,7 +136,6 @@ class AttributeExtractor:
             if s < 0.18:
                 return "Dark Grey" if v < 0.45 else ("Grey" if v < 0.72 else "Light Grey")
 
-            # 2. Hue-based color naming
             if h_deg < 14 or h_deg >= 346:
                 return "Maroon / Burgundy" if (v < 0.48 and s > 0.30) else "Red"
             elif 14 <= h_deg < 42:
@@ -230,7 +225,6 @@ class AttributeExtractor:
         try:
             im_rgb = image.convert("RGB").resize((60, 60))
             arr = np.array(im_rgb).reshape(-1, 3).astype(float)
-            # Check for white stripe pixels (v > 0.85, s < 0.15)
             hsv = [colorsys.rgb_to_hsv(p[0]/255.0, p[1]/255.0, p[2]/255.0) for p in arr]
             white_frac = sum(1 for h, s, v in hsv if v > 0.85 and s < 0.16) / len(arr)
             pink_frac = sum(1 for h, s, v in hsv if (h*360 >= 295 or h*360 < 14) and s > 0.18 and v > 0.50) / len(arr)
@@ -298,10 +292,6 @@ MATERIAL_PROMPTS = [
 ]
 
 
-# Greyscale-thumbnail correlation above which two pictures are treated as the same photo.
-# Measured on 303 catalog products: a copy resized to 60% and re-saved as JPEG quality 60 scored
-# 0.998 or higher, while the nearest *different* catalog photo scored at most 0.981. Cosine
-# similarity cannot make this distinction: 168 of the 303 had a different product at 0.93+.
 SAME_IMAGE_CORRELATION = 0.99
 
 
@@ -354,7 +344,7 @@ class RecommendationExplainer:
         """
         if not sims or sims[0] < self.exact_sim:
             return False
-        if sims[0] >= 0.985:  # the same image; other catalog photos of this product may sit close behind
+        if sims[0] >= 0.985:
             return True
         return len(sims) == 1 or (sims[0] - sims[1]) >= self.exact_margin
 
@@ -413,7 +403,6 @@ class RecommendationExplainer:
             p_style = self._zero_shot(p_emb, self.style_features, STYLE_PROMPTS)
             p_material = self._zero_shot(p_emb, self.material_features, MATERIAL_PROMPTS)
 
-            # Similarity nominates a candidate; identity is claimed only if the images match too
             is_exact = exact_top and sim == sims[0] and self.same_image(query_image, meta.get("image_path"))
 
             shared, differs = [], []
@@ -459,5 +448,4 @@ class RecommendationExplainer:
                 "image_path": meta.get("image_path"),
             })
         return explanations
-
 

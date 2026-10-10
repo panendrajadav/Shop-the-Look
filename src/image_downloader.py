@@ -99,7 +99,6 @@ class ImageDownloader:
         """
         cache_path = self._get_cache_path(image_id)
 
-        # 1. Check if already cached on disk
         if cache_path.exists() and cache_path.stat().st_size > 0:
             with self._lock:
                 self.download_stats["cached"] += 1
@@ -107,7 +106,6 @@ class ImageDownloader:
                     self.metadata[image_id] = {"status": "success", "path": str(cache_path)}
             return cache_path
 
-        # Also check alternative folder layout if previously cached under image_id[:2]/image_id[2:4]
         alt_path = self.cache_dir / image_id[:2] / image_id[2:4] / f"{image_id}.jpg"
         if alt_path.exists() and alt_path.stat().st_size > 0:
             with self._lock:
@@ -115,14 +113,12 @@ class ImageDownloader:
                 self.metadata[image_id] = {"status": "success", "path": str(alt_path)}
             return alt_path
 
-        # 2. Skip if previously recorded as permanently failed
         with self._lock:
             meta = self.metadata.get(image_id)
             if meta and meta.get("status") == "failed" and meta.get("reason") in ["404_not_found", "invalid_image"]:
                 self.download_stats["failed"] += 1
                 return None
 
-        # 3. Download image data (HTTPS first, then HTTP fallback)
         http_client = session or requests
         image_data = None
         last_error = None
@@ -148,14 +144,12 @@ class ImageDownloader:
                 self.download_stats["failed"] += 1
             return None
 
-        # 4. Validate image bytes
         if not self._validate_image(image_data):
             with self._lock:
                 self.metadata[image_id] = {"status": "failed", "reason": "invalid_image"}
                 self.download_stats["invalid"] += 1
             return None
 
-        # 5. Save to disk
         try:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             with open(cache_path, "wb") as f:
@@ -211,18 +205,15 @@ class ImageDownloader:
 
     def get_cached_image(self, image_id: str) -> Optional[Path]:
         """Get cached image path if it exists on disk and is non-empty."""
-        # 1. Check metadata
         if image_id in self.metadata and self.metadata[image_id].get("status") == "success":
             stored_path = self.metadata[image_id].get("path")
             if stored_path and Path(stored_path).exists() and Path(stored_path).stat().st_size > 0:
                 return Path(stored_path)
 
-        # 2. Check standard cache path
         cache_path = self._get_cache_path(image_id)
         if cache_path.exists() and cache_path.stat().st_size > 0:
             return cache_path
 
-        # 3. Check alternative cache path
         alt_path = self.cache_dir / image_id[:2] / image_id[2:4] / f"{image_id}.jpg"
         if alt_path.exists() and alt_path.stat().st_size > 0:
             return alt_path

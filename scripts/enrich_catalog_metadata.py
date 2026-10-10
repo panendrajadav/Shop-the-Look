@@ -15,7 +15,6 @@ import torch
 from PIL import Image
 import open_clip
 
-# Project root
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -29,7 +28,6 @@ def extract_dominant_color_from_image(im: Image.Image) -> str:
     arr = np.array(im_small)
     h, w, _ = arr.shape
 
-    # Sample border pixels for background estimate
     borders = np.concatenate([
         arr[:5, :].reshape(-1, 3),
         arr[-5:, :].reshape(-1, 3),
@@ -41,7 +39,6 @@ def extract_dominant_color_from_image(im: Image.Image) -> str:
     pixels = arr.reshape(-1, 3).astype(float)
     dist = np.linalg.norm(pixels - bg_color, axis=1)
 
-    # Background mask: close to border color OR bright neutral white
     is_bg = (dist < 38) | (
         (pixels[:, 0] > 218) & (pixels[:, 1] > 218) & (pixels[:, 2] > 218) & (np.ptp(pixels, axis=1) < 22)
     )
@@ -59,7 +56,6 @@ def extract_dominant_color_from_image(im: Image.Image) -> str:
     h_norm, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
     h_deg = h_norm * 360.0
 
-    # Classify color in HSV
     if v < 0.22 or (v < 0.35 and s < 0.22):
         return "Black"
     if v > 0.88 and s < 0.12:
@@ -99,7 +95,6 @@ def enrich_catalog():
             tf = model.encode_text(tokenizer(prompts))
             return (tf / tf.norm(dim=-1, keepdim=True)).numpy()
 
-    # One prompt per specific item; a product takes the name of its best item and that item's category
     items = [(cat, name, prompt) for cat, entries in ITEM_NAMES.items() for name, prompt in entries]
     item_sims = embeddings @ encode([f"a photo of {p}" for _, _, p in items]).T
     item_idx = item_sims.argmax(axis=1)
@@ -109,8 +104,6 @@ def enrich_catalog():
     pat_names = list(PATTERN_TAXONOMY.keys())
     pat_idx = (embeddings @ encode(list(PATTERN_TAXONOMY.values())).T).argmax(axis=1)
 
-    # Probability mass per category; the runner-up category is kept because a photo of a model
-    # wearing two garments (a tee with jeans) is genuinely ambiguous about which one is sold.
     cat_names = list(ITEM_NAMES.keys())
     item_cat = np.array([cat_names.index(c) for c, _, _ in items])
     cat_probs = np.stack([probs[:, item_cat == k].sum(axis=1) for k in range(len(cat_names))], axis=1)

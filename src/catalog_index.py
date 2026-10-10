@@ -33,11 +33,9 @@ class ProductIndex:
         """
         logger.info(f"Building index for {len(product_id_to_embedding)} products...")
 
-        # Get embedding dimension
         sample_embedding = next(iter(product_id_to_embedding.values()))
         embedding_dim = sample_embedding.shape[0]
 
-        # Build embeddings matrix
         embeddings_list = []
         self.product_ids = []
         metadata_list = []
@@ -55,12 +53,10 @@ class ProductIndex:
 
         self.embeddings = np.array(embeddings_list, dtype=np.float32)
 
-        # Create FAISS index
         logger.info(f"Creating FAISS index for {len(self.embeddings)} embeddings...")
         self.faiss_index = faiss.IndexFlatIP(embedding_dim)
         self.faiss_index.add(self.embeddings)
 
-        # Store metadata
         self.metadata = {
             prod_id: meta for prod_id, meta in zip(self.product_ids, metadata_list)
         }
@@ -72,17 +68,14 @@ class ProductIndex:
         """Save index, embeddings, and metadata to disk."""
         logger.info("Saving index...")
 
-        # Save embeddings
         np.save(self.embeddings_file, self.embeddings)
 
-        # Save metadata
         with open(self.metadata_file, "w") as f:
             json.dump({
                 "product_ids": self.product_ids,
                 "metadata": self.metadata
             }, f, indent=2)
 
-        # Save FAISS index
         if self.faiss_index:
             faiss.write_index(self.faiss_index, str(self.index_file))
 
@@ -95,14 +88,12 @@ class ProductIndex:
             True if loaded successfully, False otherwise
         """
         try:
-            # Load embeddings
             if self.embeddings_file.exists():
                 self.embeddings = np.load(self.embeddings_file)
             else:
                 logger.warning(f"Embeddings file not found: {self.embeddings_file}")
                 return False
 
-            # Load metadata
             if self.metadata_file.exists():
                 with open(self.metadata_file, "r") as f:
                     data = json.load(f)
@@ -112,17 +103,14 @@ class ProductIndex:
                 logger.warning(f"Metadata file not found: {self.metadata_file}")
                 return False
 
-            # Load FAISS index
             if self.index_file.exists():
                 self.faiss_index = faiss.read_index(str(self.index_file))
             else:
                 logger.warning(f"FAISS index file not found: {self.index_file}")
-                # Try to rebuild from embeddings
                 embedding_dim = self.embeddings.shape[1]
                 self.faiss_index = faiss.IndexFlatIP(embedding_dim)
                 self.faiss_index.add(self.embeddings)
 
-            # Optional garment-level views of products photographed on a model
             self.views = {}
             views_file = self.embeddings_file.with_name("products_views.npz")
             if views_file.exists():
@@ -154,25 +142,22 @@ class ProductIndex:
             logger.warning("Index is empty or not loaded")
             return []
 
-        # Ensure query embedding is normalized and correct shape
         if query_embedding.ndim == 1:
             query_embedding = query_embedding.reshape(1, -1)
 
         query_embedding = query_embedding.astype(np.float32)
 
-        # Search
         distances, indices = self.faiss_index.search(query_embedding, min(top_k, len(self.product_ids)))
 
         results = []
         for idx, distance in zip(indices[0], distances[0]):
             if idx < len(self.product_ids):
                 product_id = self.product_ids[idx]
-                similarity = float(distance)  # IP distance is already the similarity
+                similarity = float(distance)
                 results.append((product_id, similarity))
 
         return results
 
-    # Query category -> catalog categories that may be returned for it
     CATEGORY_POOL = {
         "Jacket / Outerwear": (["Jacket / Outerwear"], []),
         "Top / T-shirt": (["Top / T-shirt"], []),
@@ -191,7 +176,6 @@ class ProductIndex:
         """Cache per-product categories and attach each garment view to products of the matching kind."""
         self._categories = np.array([self.metadata.get(pid, {}).get("category", "") for pid in self.product_ids])
         self._item_names = np.array([self.metadata.get(pid, {}).get("item_name", "") for pid in self.product_ids])
-        # Runner-up category, used only when the product photo is ambiguous about what is sold
         self._alt_categories = np.array([
             m.get("category_alt", "") if m.get("category_alt_confidence", 0.0) >= 0.20 else ""
             for m in (self.metadata.get(pid, {}) for pid in self.product_ids)
@@ -210,11 +194,6 @@ class ProductIndex:
                 keep = np.isin(self._categories[rows], cats)
                 self._view_sets.append((rows[keep], embs[keep]))
 
-        # Domain centring. Scene crops and catalog photos occupy different regions of the CLIP
-        # space: every scene crop shares a "street photo" component and every catalog image a
-        # "product photo" component. Removing each side's mean before comparing leaves the
-        # garment-specific part, which is what should decide the ranking. Both means are
-        # computed without labels (scripts/build_query_stats.py for the query side).
         def _unit(x):
             return x / (np.linalg.norm(x, axis=-1, keepdims=True) + 1e-8)
 
@@ -277,8 +256,8 @@ class ProductIndex:
         if not target_category or not self.metadata or self.embeddings is None:
             return [(pid, sim, sim) for pid, sim in self.search(query_embedding, top_k=candidate_pool_size)]
 
-        sims = self.similarities(query_embedding)       # plain cosine: reported and used for duplicates
-        scores = self.ranking_scores(query_embedding)   # domain-centred: used for ordering
+        sims = self.similarities(query_embedding)
+        scores = self.ranking_scores(query_embedding)
         preferred, _ = self.CATEGORY_POOL.get(target_category, ([target_category], []))
         in_category = np.isin(self._categories, preferred) | np.isin(self._alt_categories, preferred)
         if target_category == "Accessory" and target_item:
@@ -294,7 +273,7 @@ class ProductIndex:
                 break
             if int(i) not in chosen:
                 picked.append(int(i))
-        if len(picked) < 3:  # nothing of this category in the catalog: fall back to closest overall
+        if len(picked) < 3:
             picked = [int(i) for i in order[:candidate_pool_size]]
         picked.sort(key=lambda i: -scores[i])
         return [(self.product_ids[i], float(sims[i]), float(scores[i])) for i in picked]

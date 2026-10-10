@@ -50,7 +50,6 @@ class RetrievalEvaluator:
         gt_set = set(ground_truth_products)
         num_gt = len(gt_set)
 
-        # First relevant product rank (1-indexed) for Reciprocal Rank
         reciprocal_rank = 0.0
         first_hit_rank = None
         for rank_idx, pid in enumerate(retrieved_ids, 1):
@@ -59,7 +58,6 @@ class RetrievalEvaluator:
                 first_hit_rank = rank_idx
                 break
 
-        # Recall@K calculation
         recalls = {}
         hits = {}
         for k in self.recalls_at:
@@ -220,7 +218,7 @@ class EvaluationPipeline:
             return None
         built = retrieval.build_queries(scene_image)
         for q in built["queries"]:
-            q["crop_image"] = None  # embeddings and attributes are enough for matching
+            q["crop_image"] = None
         cache[scene_id] = built
         return built
 
@@ -267,7 +265,7 @@ class EvaluationPipeline:
 
         index = self.catalog_index
         retrieval = SceneRetrieval(self.image_encoder, index, self.garment_detector)
-        index.similarities(index.embeddings[0])  # prepares category arrays
+        index.similarities(index.embeddings[0])
 
         self.coverage_stats["total_validation_pairs"] = len(validation_pairs)
         self.coverage_stats["unique_scenes"] = len(scene_to_products)
@@ -297,8 +295,6 @@ class EvaluationPipeline:
             built = self._scene_queries(retrieval, cache, scene_id, scene_img_path)
             if built is None:
                 continue
-            # Full reranked list per item; cross-item de-duplication is a display feature and is
-            # switched off here so each item's ranking can be inspected on its own.
             garments = retrieval.match_queries(built, top_k_per_garment=CANDIDATE_POOL_SIZE, remove_duplicates=False)
 
             eligible_gt = set(p for p in gt_prods if p in indexed)
@@ -319,7 +315,6 @@ class EvaluationPipeline:
                 self.breakdown.append(row)
                 continue
 
-            # Fuse candidates across items: each product keeps its best rerank score.
             product_best = {}
             shown_top3, shown_top5 = set(), set()
             for g in garments:
@@ -355,7 +350,6 @@ class EvaluationPipeline:
         self.coverage_stats["eligible_scenes_evaluated"] = len(self.evaluator.results)
         metrics = self.evaluator.compute_metrics()
         if demo_hits:
-            # Share of scenes where the labelled product is among the per-item cards the demo shows
             metrics["demo_hit@3_per_garment"] = float(np.mean([h[0] for h in demo_hits]))
             metrics["demo_hit@5_per_garment"] = float(np.mean([h[1] for h in demo_hits]))
         metrics["exact_badges_fired"] = exact_fired

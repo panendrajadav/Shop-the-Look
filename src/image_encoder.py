@@ -32,9 +32,7 @@ class CLIPImageEncoder:
             )
             self.model.eval()
 
-            # Get embedding dimension
             with torch.no_grad():
-                # Create a dummy image to determine output size
                 dummy_img = Image.new("RGB", (224, 224))
                 dummy_input = self.preprocess(dummy_img).unsqueeze(0).to(self.device)
                 dummy_features = self.model.encode_image(dummy_input)
@@ -64,7 +62,6 @@ class CLIPImageEncoder:
             with torch.no_grad():
                 image_input = self.preprocess(image).unsqueeze(0).to(self.device)
                 image_features = self.model.encode_image(image_input)
-                # Normalize embeddings
                 image_features = image_features / image_features.norm(dim=-1, keepdim=True)
             return image_features.cpu().numpy()[0].astype(np.float32)
         except Exception as e:
@@ -88,7 +85,6 @@ class CLIPImageEncoder:
             valid_paths = []
             images = []
 
-            # Load and preprocess images
             for path in batch_paths:
                 try:
                     image = Image.open(path).convert("RGB")
@@ -101,15 +97,12 @@ class CLIPImageEncoder:
             if not images:
                 continue
 
-            # Encode batch
             try:
                 with torch.no_grad():
                     batch_tensor = torch.stack(images).to(self.device)
                     batch_features = self.model.encode_image(batch_tensor)
-                    # Normalize
                     batch_features = batch_features / batch_features.norm(dim=-1, keepdim=True)
 
-                # Store results
                 for path, embedding in zip(valid_paths, batch_features.cpu().numpy()):
                     embeddings[path] = embedding.astype(np.float32)
             except Exception as e:

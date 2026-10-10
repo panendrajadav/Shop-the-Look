@@ -7,7 +7,6 @@ from typing import Optional, List, Dict
 from PIL import Image, ImageOps
 import streamlit as st
 
-# Add project root to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -28,7 +27,6 @@ from src.data_loader import ValidationLoader
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Page configuration
 st.set_page_config(
     page_title="Shop the Look | Visual Product Discovery",
     page_icon="🛍️",
@@ -36,7 +34,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Clean, modern CSS styling
 st.markdown("""
 <style>
     .product-card {
@@ -178,11 +175,9 @@ def render_product_card(exp: dict):
 
 
 def main():
-    # 1. Header
     st.title("🛍️ Shop the Look")
     st.caption("Detect fashion items in real-world outfit photos and discover matching products from the catalog.")
 
-    # Load core models
     index, encoder, downloader, retrieval, explainer, garment_detector = load_system()
 
     if index is None:
@@ -191,7 +186,6 @@ def main():
 
     sample_scenes, scene_to_gt = load_sample_scenes()
 
-    # Sidebar settings
     with st.sidebar:
         st.header("⚙️ Settings")
         top_k = st.slider("Recommendations per garment", min_value=1, max_value=5, value=3)
@@ -205,7 +199,6 @@ def main():
             st.cache_resource.clear()
             st.rerun()
 
-    # 2. Image Input Section
     col_input, col_display = st.columns([1, 1.2], gap="large")
 
     with col_input:
@@ -260,7 +253,6 @@ def main():
             else:
                 st.info("Validation scenes not found in `data/validation.jsonl`.")
 
-    # 3. Detection & Garment Isolation
     detected_garments = []
     if query_image is not None:
         with st.spinner("Detecting garments and finding matching products..."):
@@ -280,7 +272,6 @@ def main():
             if current_scene_id:
                 st.caption(f"Scene ID: `{current_scene_id}` | Benchmark Positives: {len(known_gt_ids)}")
 
-    # 4. Results & Garment Selection Section
     with col_display:
         st.subheader("2. Recommended Catalog Products")
 
@@ -289,9 +280,6 @@ def main():
         elif not detected_garments:
             st.warning("No individual garments could be isolated from this image.")
         else:
-            # Garment Selector
-            # "Full Outfit" lists the single best catalog match for every detected item;
-            # the other options show more candidates for one item.
             parts = [g for g in detected_garments if g["garment_label"] != "Full Outfit / Look"] or detected_garments
             labels = ["✨ Full Outfit"] + [
                 f"{g.get('icon', '🏷️')} {g.get('item_name', g['garment_label'])} ({g.get('dominant_color', '')})"
@@ -327,7 +315,6 @@ def main():
 
         if query_image is not None and detected_garments and selected_garment is not None:
 
-            # Display selected garment crop and attributes
             g_col1, g_col2 = st.columns([1, 2], gap="medium")
             with g_col1:
                 st.image(
@@ -362,8 +349,6 @@ def main():
                 for exp in explanations:
                     render_product_card(exp)
 
-    # 4b. Benchmark answer for validation scenes. Shown for manual checking only:
-    # these labels are never passed to the detector, ranker, or match badges above.
     if current_scene_id and query_image is not None:
         st.markdown("---")
         with st.expander("🎯 Benchmark answer for this scene (validation label, not used for predictions)", expanded=False):
@@ -383,7 +368,6 @@ def main():
                     else:
                         st.write("❌ In the catalog but not in the top results.")
 
-    # 5. Optional Developer Diagnostics (Collapsed by Default)
     if query_image is not None and detected_garments:
         st.markdown("---")
         with st.expander("🛠️ Developer Diagnostics (Raw Boxes, Confidences & Rerank Breakdown)", expanded=False):
@@ -414,7 +398,6 @@ def main():
                 if g_diags:
                     st.dataframe(g_diags, use_container_width=True)
 
-    # 6. Optional Benchmark Evaluation (Collapsed by Default)
     if EVAL_RESULTS_JSON.exists():
         with st.expander("📊 Benchmark Metrics (`validation.jsonl`)", expanded=False):
             try:

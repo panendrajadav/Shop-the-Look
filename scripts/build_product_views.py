@@ -31,7 +31,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 VIEW_CATEGORIES = {"Top / T-shirt", "Jacket / Outerwear", "Pants / Trousers", "Skirt"}
-# (region name, fractional box) - same body bands used for scenes without a detected person
 VIEW_BOXES = [("upper", (0.08, 0.05, 0.92, 0.58)), ("lower", (0.10, 0.42, 0.90, 0.92))]
 
 
@@ -41,12 +40,8 @@ def build_product_views():
         meta_json = json.load(f)
     product_ids, metadata = meta_json["product_ids"], meta_json["metadata"]
 
-    # Garment photos are often taken on a model and framed around the torso or legs, with a
-    # second garment in shot. Every product whose estimated category is a top, jacket, pants
-    # or skirt therefore gets both an upper and a lower view.
     encoder = CLIPImageEncoder(model_name=MODEL_NAME, pretrained=PRETRAINED, device=DEVICE)
     has_views = np.array([metadata[pid].get("category") in VIEW_CATEGORIES for pid in product_ids])
-    # Incremental: products that already have views (from an earlier run) are not re-encoded
     old = np.load(PRODUCTS_VIEWS_FILE) if PRODUCTS_VIEWS_FILE.exists() else None
     done = set(old["rows"].tolist()) if old is not None else set()
     rows = np.array([r for r in np.where(has_views)[0] if r not in done], dtype=np.int64)

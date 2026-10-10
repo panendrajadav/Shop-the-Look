@@ -10,7 +10,6 @@ from src.color_features import color_histogram
 
 logger = logging.getLogger(__name__)
 
-# Category compatibility matrix: maps query category to compatible categories
 CATEGORY_COMPATIBILITY = {
     "Jacket / Outerwear": {
         "preferred": ["Jacket / Outerwear"],
@@ -59,12 +58,8 @@ CATEGORY_COMPATIBILITY = {
     },
 }
 
-# Candidates taken per detected item before reranking
 CANDIDATE_POOL_SIZE = 200
 
-# Rerank adjustments, added to the ranking score. Chosen from an ablation on the validation
-# scenes (TECHNICAL_REPORT.md): every setting tried moved the labelled product by at most a
-# few scenes out of 282, so the smallest values that did not hurt are used.
 COLOR_WEIGHT = 0.05
 PATTERN_WEIGHT = 0.02
 ITEM_WEIGHT = 0.03
@@ -76,20 +71,16 @@ def _generate_scene_crops(image: Image.Image) -> List[Tuple[str, Image.Image]]:
     w, h = image.size
     crops = [("full", image)]
 
-    # Center crop
     cx, cy = w // 2, h // 2
     crop_w, crop_h = int(w * 0.65), int(h * 0.75)
     x1, y1 = max(0, cx - crop_w // 2), max(0, cy - crop_h // 2)
     x2, y2 = min(w, cx + crop_w // 2), min(h, cy + crop_h // 2)
     crops.append(("center", image.crop((x1, y1, x2, y2))))
 
-    # Upper body
     crops.append(("upper", image.crop((int(w * 0.08), int(h * 0.05), int(w * 0.92), int(h * 0.58)))))
 
-    # Lower body
     crops.append(("lower", image.crop((int(w * 0.10), int(h * 0.42), int(w * 0.90), int(h * 0.92)))))
 
-    # Footwear (lower base of scene)
     crops.append(("footwear", image.crop((int(w * 0.12), int(h * 0.78), int(w * 0.88), int(h * 0.99)))))
 
     return crops
@@ -207,7 +198,6 @@ class SceneRetrieval:
             cand_cat = meta.get("category", "")
             cand_pattern = meta.get("pattern", "Solid Color")
 
-            # 1. Category
             cat_delta, cat_status = 0.0, "Neutral"
             if query_category and preferred_cats:
                 if cand_cat in preferred_cats:
@@ -217,23 +207,19 @@ class SceneRetrieval:
                 else:
                     cat_delta, cat_status = CATEGORY_MISMATCH_PENALTY, "Category Mismatch"
 
-            # 2. Color: share of the query garment's color distribution found in the product
             color_delta, color_status = 0.0, "Neutral"
             color_sim = self.catalog_index.color_similarity(pid, query_hist) if hasattr(self.catalog_index, "color_similarity") else None
             if color_sim is not None:
                 color_delta = COLOR_WEIGHT * (color_sim - 0.5)
                 color_status = f"Color overlap {color_sim:.2f}"
 
-            # 3. Pattern
             pattern_delta, pattern_status = 0.0, "Neutral"
             if query_pattern and cand_pattern == query_pattern:
                 pattern_delta, pattern_status = PATTERN_WEIGHT, f"Pattern Match ({cand_pattern})"
 
-            # 4. Same specific item (Jeans with Jeans, Blazer with Blazer)
             item_delta = ITEM_WEIGHT if (query_item and meta.get("item_name") == query_item) else 0.0
 
             rerank_score = base + cat_delta + color_delta + pattern_delta + item_delta
-            # A near-duplicate image is the catalog photo itself: keep it on top
             if raw_sim >= 0.97:
                 rerank_score = raw_sim + 1.0
 
@@ -268,7 +254,7 @@ class SceneRetrieval:
             if emb is None:
                 continue
             item_name = p.get("item_name") or self.garment_detector.name_item(emb, p["label"])
-            if item_name in seen:  # one query per distinct item
+            if item_name in seen:
                 continue
             seen.add(item_name)
             queries.append({
@@ -305,8 +291,6 @@ class SceneRetrieval:
         global_used_pids = set()
         w, h = built["size"]
 
-        # Whole-image duplicate check: if the photo itself is (nearly) a catalog image, surface
-        # that product first even when no garment crop covers the full frame.
         full_emb = built.get("full_embedding")
         if full_emb is not None:
             full_hits = self.catalog_index.search(full_emb, top_k=max(top_k_per_garment, 30))
@@ -337,7 +321,6 @@ class SceneRetrieval:
                 candidate_pool_size=CANDIDATE_POOL_SIZE, target_item=q["item_name"],
             )
 
-            # Products already recommended for another item of this photo are skipped
             candidates = [c for c in raw_candidates if not (remove_duplicates and c[0] in global_used_pids)]
             if len(candidates) < top_k_per_garment:
                 candidates = raw_candidates

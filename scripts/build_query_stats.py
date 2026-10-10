@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 def build_query_stats():
     with open(VALIDATION_FILE, "r", encoding="utf-8") as f:
-        scene_ids = sorted({json.loads(line)["scene"] for line in f if line.strip()})  # IDs only
+        scene_ids = sorted({json.loads(line)["scene"] for line in f if line.strip()})
 
     index = ProductIndex(PRODUCTS_EMBEDDINGS_FILE, PRODUCTS_METADATA_FILE, PRODUCTS_INDEX_FILE)
     index.load()

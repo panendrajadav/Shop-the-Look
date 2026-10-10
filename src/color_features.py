@@ -42,7 +42,6 @@ def color_histogram(
         border = np.concatenate([rgb[:3].reshape(-1, 3), rgb[-3:].reshape(-1, 3),
                                  rgb[:, :3].reshape(-1, 3), rgb[:, -3:].reshape(-1, 3)])
         bg = np.median(border, axis=0)
-        # Only a uniform border is a backdrop; a busy border means the photo has no plain background
         if np.mean(np.linalg.norm(border - bg, axis=1) < 30) > 0.7:
             keep &= np.linalg.norm(rgb - bg, axis=2) >= 34
 
@@ -76,7 +75,7 @@ def color_histogram(
 
     achromatic = (s < 0.18) | (v < 0.18)
     bins = np.empty(len(px), dtype=np.int64)
-    bins[achromatic] = np.digitize(v[achromatic], [0.25, 0.55, 0.85])            # 0..3
+    bins[achromatic] = np.digitize(v[achromatic], [0.25, 0.55, 0.85])
     chroma = ~achromatic
     bins[chroma] = 4 + (hue[chroma] // 30).astype(np.int64) % 12 * 2 + (v[chroma] >= 0.55)
 
