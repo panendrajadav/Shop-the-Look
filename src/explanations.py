@@ -1,4 +1,4 @@
-import logging
+﻿import logging
 from typing import Optional, Tuple, List, Dict, Union, Any
 from pathlib import Path
 import colorsys
@@ -277,171 +277,187 @@ class AttributeExtractor:
         }
 
 
+STYLE_PROMPTS = [
+    ("Casual", "a casual everyday piece of clothing"),
+    ("Formal / Tailored", "a formal, tailored, office-wear fashion item"),
+    ("Sporty / Athletic", "a sporty athletic activewear item"),
+    ("Elegant / Evening", "an elegant evening or party fashion item"),
+    ("Bohemian / Vintage", "a bohemian or vintage style fashion item"),
+    ("Streetwear / Edgy", "an edgy streetwear fashion item"),
+]
+
+MATERIAL_PROMPTS = [
+    ("Denim", "a fashion item made of denim"),
+    ("Leather", "a fashion item made of leather"),
+    ("Knit / Wool", "a fashion item made of knitted wool"),
+    ("Cotton / Jersey", "a fashion item made of soft cotton jersey"),
+    ("Silk / Satin", "a fashion item made of shiny silk or satin"),
+    ("Lace / Sheer", "a fashion item made of lace or sheer fabric"),
+    ("Suede / Velvet", "a fashion item made of suede or velvet"),
+    ("Metal / Jewelry", "a metal jewelry accessory"),
+]
+
+
+# Greyscale-thumbnail correlation above which two pictures are treated as the same photo.
+# Measured on 303 catalog products: a copy resized to 60% and re-saved as JPEG quality 60 scored
+# 0.998 or higher, while the nearest *different* catalog photo scored at most 0.981. Cosine
+# similarity cannot make this distinction: 168 of the 303 had a different product at 0.93+.
+SAME_IMAGE_CORRELATION = 0.99
+
+
 class RecommendationExplainer:
-    """Generates transparent, evidence-grounded explanations for recommendations."""
+    """Explains each recommendation by comparing the query garment with the catalog product.
 
-    def __init__(self, catalog_index, clip_encoder=None):
+    Every statement comes from the two images (pixels and CLIP embeddings). No validation
+    label is used here: the exact / similar decision is a prediction from similarity scores.
+    """
+
+    def __init__(self, catalog_index, clip_encoder=None, exact_sim: float = 0.93, exact_margin: float = 0.03):
         self.catalog_index = catalog_index
+        self.clip_encoder = clip_encoder
         self.extractor = AttributeExtractor(clip_encoder)
+        self.exact_sim = exact_sim
+        self.exact_margin = exact_margin
+        self.style_features = None
+        self.material_features = None
+        self._pid_to_row = {pid: i for i, pid in enumerate(catalog_index.product_ids)}
+        if clip_encoder is not None:
+            try:
+                import open_clip
+                tokenizer = open_clip.get_tokenizer(clip_encoder.model_name)
+                with torch.no_grad():
+                    for name, prompts in (("style_features", STYLE_PROMPTS), ("material_features", MATERIAL_PROMPTS)):
+                        f = clip_encoder.model.encode_text(tokenizer([p[1] for p in prompts]).to(clip_encoder.device))
+                        setattr(self, name, (f / f.norm(dim=-1, keepdim=True)).cpu().numpy())
+            except Exception as e:
+                logger.debug(f"Style/material prompt initialization failed: {e}")
 
-    def explain_recommendation(
-        self,
-        product_id: str,
-        similarity_score: float,
-        rank: int = 1,
-        query_image: Optional[Image.Image] = None,
-        query_category: Optional[str] = None,
-        is_exact_catalog_match: bool = False,
-        rerank_score: Optional[float] = None,
-    ) -> dict:
-        """Generate an evidence-grounded explanation for a recommendation."""
-        metadata = self.catalog_index.get_metadata(product_id) or {}
-        image_path = metadata.get("image_path")
-        prod_category = metadata.get("category", "Apparel")
+    def _zero_shot(self, emb: Optional[np.ndarray], features: Optional[np.ndarray], prompts) -> Optional[str]:
+        if emb is None or features is None:
+            return None
+        return prompts[int(np.argmax(features @ emb))][0]
 
-        # Extract catalog product visual attributes from cached metadata if available, else pixels
-        prod_color = metadata.get("dominant_color")
-        prod_pattern = metadata.get("pattern")
+    def _encode(self, image: Image.Image) -> Optional[np.ndarray]:
+        if self.clip_encoder is None:
+            return None
+        with torch.no_grad():
+            t = self.clip_encoder.preprocess(image.convert("RGB")).unsqueeze(0).to(self.clip_encoder.device)
+            f = self.clip_encoder.model.encode_image(t)
+            f = f / f.norm(dim=-1, keepdim=True)
+        return f.cpu().numpy()[0].astype(np.float32)
 
-        if not prod_color and image_path and Path(image_path).exists():
-            attrs = self.extractor.extract_attributes(image_path)
-            prod_color = attrs["dominant_color"]
-            prod_pattern = attrs["pattern"]
+    def is_exact(self, sims: List[float]) -> bool:
+        """Predict whether the top result is the same product as the query.
 
-        prod_color = prod_color or "Neutral"
-        prod_pattern = prod_pattern or "Solid Color"
+        Requires a very high similarity and a clear gap to the runner-up, so a crowd of
+        look-alikes is reported as "similar" instead of a false exact match.
+        """
+        if not sims or sims[0] < self.exact_sim:
+            return False
+        if sims[0] >= 0.985:  # the same image; other catalog photos of this product may sit close behind
+            return True
+        return len(sims) == 1 or (sims[0] - sims[1]) >= self.exact_margin
 
-        # Query attributes
-        query_color = None
-        query_pattern = None
-        if query_image is not None:
-            q_attrs = self.extractor.extract_attributes(query_image)
-            query_color = q_attrs["dominant_color"]
-            query_pattern = q_attrs["pattern"]
+    @staticmethod
+    def same_image(query_image: Optional[Image.Image], product_path: Optional[str]) -> bool:
+        """Pixel-level check that the query is the catalog photo itself.
 
-        # Category alignment evaluation
-        category_aligned = False
-        if query_category and prod_category:
-            norm_q = query_category.lower()
-            norm_p = prod_category.lower()
-            category_aligned = (
-                (norm_q in norm_p) or (norm_p in norm_q) or
-                ("outfit" in norm_q) or ("look" in norm_q) or
-                ("jacket" in norm_q and "jacket" in norm_p) or
-                ("top" in norm_q and "top" in norm_p) or
-                ("pants" in norm_q and "pants" in norm_p) or
-                ("dress" in norm_q and "dress" in norm_p) or
-                ("skirt" in norm_q and "skirt" in norm_p) or
-                ("footwear" in norm_q and "footwear" in norm_p) or
-                ("bag" in norm_q and "bag" in norm_p)
-            )
-
-        # Color compatibility evaluation
-        color_match = False
-        color_compatible = False
-        if query_color:
-            if query_color == prod_color:
-                color_match = True
-            elif ("Grey" in query_color and "Grey" in prod_color) or \
-                 ("Black" in query_color and "Dark" in prod_color) or \
-                 ("Blue" in query_color and "Blue" in prod_color):
-                color_compatible = True
-
-        # Construct honest evidence reasons
-        evidence_points = []
-        if category_aligned:
-            evidence_points.append(f"Matching silhouette and category ({prod_category})")
-        else:
-            evidence_points.append(f"Catalog category: {prod_category} (Query: {query_category or 'Apparel'})")
-
-        if color_match:
-            evidence_points.append(f"Direct color alignment ({prod_color})")
-        elif color_compatible:
-            evidence_points.append(f"Harmonious tone ({query_color} query vs {prod_color} product)")
-        elif query_color:
-            evidence_points.append(f"Product color: {prod_color} (Query: {query_color})")
-        else:
-            evidence_points.append(f"Product color: {prod_color}")
-
-        if prod_pattern != "Solid Color":
-            evidence_points.append(f"Pattern: {prod_pattern}")
-
-        match_label = (
-            "Verified Exact Product Match"
-            if is_exact_catalog_match
-            else "Visually Similar Candidate (Exact identity: unverified)"
-        )
-
-        final_rerank = round(float(rerank_score), 4) if rerank_score is not None else round(float(similarity_score), 4)
-
-        # Grounded explanation summary as specified in requirements
-        if is_exact_catalog_match:
-            summary = (
-                f"Verified positive benchmark match: Catalog product {product_id} is the exact item "
-                f"from validation data. Visual similarity: {similarity_score:.4f}."
-            )
-        elif category_aligned:
-            cat_phrase = {
-                "Jacket / Outerwear": "outerwear silhouette",
-                "Top / T-shirt": "top/shirt silhouette",
-                "Skirt": "skirt silhouette",
-                "Pants / Trousers": "trouser cut",
-                "Dress": "dress silhouette",
-            }.get(prod_category, "garment silhouette")
-            pat_phrase = f" and {prod_pattern.lower()} pattern" if prod_pattern != "Solid Color" else ""
-            summary = (
-                f"Recommended because the catalog item is a {prod_color} {prod_category} "
-                f"with matching {cat_phrase}{pat_phrase} and color tone. Visual similarity: {similarity_score:.4f}. "
-                f"Exact identity: unverified."
-            )
-        else:
-            summary = (
-                f"Recommended as a visually similar alternative ({prod_color} {prod_category}). "
-                f"Visual similarity: {similarity_score:.4f}. Exact identity: unverified."
-            )
-
-        return {
-            "product_id": product_id,
-            "rank": rank,
-            "cosine_similarity": round(float(similarity_score), 4),
-            "rerank_score": final_rerank,
-            "category": prod_category,
-            "dominant_color": prod_color,
-            "pattern": prod_pattern,
-            "category_aligned": category_aligned,
-            "color_match": color_match,
-            "match_type": match_label,
-            "is_exact_match": is_exact_catalog_match,
-            "evidence": evidence_points,
-            "summary": summary,
-            "image_path": image_path,
-        }
+        Embedding similarity alone cannot establish identity: two different white shirts can
+        score very high. An exact match is therefore claimed only when the two pictures also
+        agree pixel by pixel (correlation of 32x32 greyscale thumbnails), which is true for the
+        same photo after resizing or re-compression and false for a different photo of even the
+        same product.
+        """
+        if query_image is None or not product_path:
+            return False
+        try:
+            a = np.asarray(query_image.convert("L").resize((32, 32)), dtype=np.float32).ravel()
+            with Image.open(product_path) as im:
+                b = np.asarray(im.convert("L").resize((32, 32)), dtype=np.float32).ravel()
+            a, b = a - a.mean(), b - b.mean()
+            denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+            return denom > 0 and float(a @ b) / denom >= SAME_IMAGE_CORRELATION
+        except Exception:
+            return False
 
     def explain_batch(
         self,
         results: List[Any],
         query_image: Optional[Image.Image] = None,
         query_category: Optional[str] = None,
-        ground_truth_ids: Optional[set] = None,
     ) -> List[dict]:
-        """Generate explanations for a batch of retrieved results."""
+        """Generate explanations for a ranked list of (product_id, cosine, [rerank]) results."""
+        q_attrs, q_style, q_material = {}, None, None
+        if query_image is not None:
+            q_attrs = self.extractor.extract_attributes(query_image)
+            q_emb = self._encode(query_image)
+            q_style = self._zero_shot(q_emb, self.style_features, STYLE_PROMPTS)
+            q_material = self._zero_shot(q_emb, self.material_features, MATERIAL_PROMPTS)
+        q_color = q_attrs.get("primary_color")
+        q_pattern = q_attrs.get("pattern")
+        whole_look = bool(query_category) and ("Outfit" in query_category or "Whole" in query_category)
+
+        sims = sorted((float(r[1]) for r in results), reverse=True)
+        exact_top = self.is_exact(sims)
+
         explanations = []
-        gt = ground_truth_ids or set()
-        for rank, res_item in enumerate(results, 1):
-            if len(res_item) >= 3:
-                product_id, sim, rerank = res_item[0], res_item[1], res_item[2]
+        for rank, res in enumerate(results, 1):
+            pid, sim = res[0], float(res[1])
+            rerank = float(res[2]) if len(res) >= 3 else sim
+            meta = self.catalog_index.get_metadata(pid) or {}
+            p_cat = meta.get("category", "Apparel")
+            p_color = meta.get("dominant_color") or "Neutral"
+            p_pattern = meta.get("pattern") or "Solid Color"
+            row = self._pid_to_row.get(pid)
+            p_emb = self.catalog_index.embeddings[row] if row is not None else None
+            p_style = self._zero_shot(p_emb, self.style_features, STYLE_PROMPTS)
+            p_material = self._zero_shot(p_emb, self.material_features, MATERIAL_PROMPTS)
+
+            # Similarity nominates a candidate; identity is claimed only if the images match too
+            is_exact = exact_top and sim == sims[0] and self.same_image(query_image, meta.get("image_path"))
+
+            shared, differs = [], []
+
+            def compare(name, q_val, p_val, skip=False):
+                if skip or not q_val or not p_val:
+                    return
+                (shared if q_val == p_val else differs).append(
+                    f"{name}: {p_val}" if q_val == p_val else f"{name}: {p_val} (query looks {q_val})"
+                )
+
+            compare("Category", query_category, p_cat, skip=whole_look)
+            compare("Color", q_color, p_color)
+            compare("Pattern", q_pattern, p_pattern)
+            compare("Style", q_style, p_style)
+            compare("Material", q_material, p_material)
+
+            if is_exact:
+                headline = (
+                    f"Exact match: this is the same photo as the catalog image "
+                    f"(similarity {sim:.3f}, verified pixel by pixel)."
+                )
+            elif sim >= 0.80:
+                headline = f"Very close look-alike (similarity {sim:.3f}); no exact catalog match was confirmed."
             else:
-                product_id, sim = res_item[0], res_item[1]
-                rerank = sim
-            is_exact = product_id in gt
-            exp = self.explain_recommendation(
-                product_id=product_id,
-                similarity_score=sim,
-                rank=rank,
-                query_image=query_image,
-                query_category=query_category,
-                is_exact_catalog_match=is_exact,
-                rerank_score=rerank,
-            )
-            explanations.append(exp)
+                headline = f"Visually similar alternative (similarity {sim:.3f}); no exact catalog match was found."
+
+            explanations.append({
+                "product_id": pid,
+                "rank": rank,
+                "cosine_similarity": round(sim, 4),
+                "rerank_score": round(rerank, 4),
+                "category": p_cat,
+                "dominant_color": p_color,
+                "pattern": p_pattern,
+                "style": p_style or "N/A",
+                "material": p_material or "N/A",
+                "is_exact_match": is_exact,
+                "match_type": "Exact Match" if is_exact else "Visually Similar",
+                "shared": shared,
+                "differs": differs,
+                "summary": headline,
+                "image_path": meta.get("image_path"),
+            })
         return explanations
+
+

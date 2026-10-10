@@ -122,6 +122,17 @@ class ProductIndex:
                 self.faiss_index = faiss.IndexFlatIP(embedding_dim)
                 self.faiss_index.add(self.embeddings)
 
+            # Optional garment-level views of products photographed on a model
+            self.views = {}
+            views_file = self.embeddings_file.with_name("products_views.npz")
+            if views_file.exists():
+                data = np.load(views_file)
+                for region in np.unique(data["regions"]):
+                    mask = data["regions"] == region
+                    rows = data["rows"][mask]
+                    keep = rows < len(self.product_ids)
+                    self.views[str(region)] = (rows[keep], data["embeddings"][mask][keep])
+
             logger.info(f"Index loaded successfully. {len(self.product_ids)} products available")
             return True
 
@@ -161,172 +172,141 @@ class ProductIndex:
 
         return results
 
+    # Query category -> catalog categories that may be returned for it
+    CATEGORY_POOL = {
+        "Jacket / Outerwear": (["Jacket / Outerwear"], []),
+        "Top / T-shirt": (["Top / T-shirt"], []),
+        "Pants / Trousers": (["Pants / Trousers"], []),
+        "Skirt": (["Skirt"], []),
+        "Dress": (["Dress"], []),
+        "Footwear": (["Footwear"], []),
+        "Bag / Handbag": (["Bag / Handbag"], []),
+        "Accessory": (["Accessory"], []),
+        "Full Outfit / Look": (["Dress", "Jacket / Outerwear", "Top / T-shirt", "Pants / Trousers", "Skirt"], []),
+    }
+    UPPER_CATEGORIES = ("Top / T-shirt", "Jacket / Outerwear")
+    LOWER_CATEGORIES = ("Pants / Trousers", "Skirt")
+
+    def _prepare_search(self):
+        """Cache per-product categories and attach each garment view to products of the matching kind."""
+        self._categories = np.array([self.metadata.get(pid, {}).get("category", "") for pid in self.product_ids])
+        self._item_names = np.array([self.metadata.get(pid, {}).get("item_name", "") for pid in self.product_ids])
+        # Runner-up category, used only when the product photo is ambiguous about what is sold
+        self._alt_categories = np.array([
+            m.get("category_alt", "") if m.get("category_alt_confidence", 0.0) >= 0.20 else ""
+            for m in (self.metadata.get(pid, {}) for pid in self.product_ids)
+        ])
+        self._row_of = {pid: i for i, pid in enumerate(self.product_ids)}
+        self.color_hists = None
+        color_file = self.embeddings_file.with_name("products_color_hist.npy")
+        if color_file.exists():
+            hists = np.load(color_file)
+            if len(hists) == len(self.product_ids):
+                self.color_hists = hists
+        self._view_sets = []
+        for region, cats in (("upper", self.UPPER_CATEGORIES), ("lower", self.LOWER_CATEGORIES)):
+            if region in getattr(self, "views", {}):
+                rows, embs = self.views[region]
+                keep = np.isin(self._categories[rows], cats)
+                self._view_sets.append((rows[keep], embs[keep]))
+
+        # Domain centring. Scene crops and catalog photos occupy different regions of the CLIP
+        # space: every scene crop shares a "street photo" component and every catalog image a
+        # "product photo" component. Removing each side's mean before comparing leaves the
+        # garment-specific part, which is what should decide the ranking. Both means are
+        # computed without labels (scripts/build_query_stats.py for the query side).
+        def _unit(x):
+            return x / (np.linalg.norm(x, axis=-1, keepdims=True) + 1e-8)
+
+        self._query_mean = None
+        mean_file = self.embeddings_file.with_name("query_domain_mean.npy")
+        if mean_file.exists():
+            self._query_mean = np.load(mean_file).astype(np.float32)
+            self._centred = _unit(self.embeddings - self.embeddings.mean(axis=0)).astype(np.float32)
+            self._centred_views = [(rows, _unit(embs - embs.mean(axis=0)).astype(np.float32))
+                                   for rows, embs in self._view_sets]
+
+    def similarities(self, query_embedding: np.ndarray) -> np.ndarray:
+        """Cosine similarity of the query to every product.
+
+        A top or jacket photographed on a model is scored by the better of its whole image and
+        its upper-body view; pants and skirts by the whole image and the lower-body view. This
+        compares garment with garment instead of garment with whole outfit.
+        """
+        if getattr(self, "_categories", None) is None or len(self._categories) != len(self.product_ids):
+            self._prepare_search()
+        q_vec = query_embedding.reshape(-1).astype(np.float32)
+        sims = self.embeddings @ q_vec
+        for rows, embs in self._view_sets:
+            np.maximum.at(sims, rows, embs @ q_vec)
+        return sims
+
+    def ranking_scores(self, query_embedding: np.ndarray) -> np.ndarray:
+        """Scores used to order products for a detected item: domain-centred cosine similarity.
+
+        Falls back to plain cosine similarity when no query-domain mean has been built.
+        """
+        if getattr(self, "_categories", None) is None or len(self._categories) != len(self.product_ids):
+            self._prepare_search()
+        if self._query_mean is None:
+            return self.similarities(query_embedding)
+        q = query_embedding.reshape(-1).astype(np.float32) - self._query_mean
+        q = q / (np.linalg.norm(q) + 1e-8)
+        scores = self._centred @ q
+        for rows, embs in self._centred_views:
+            np.maximum.at(scores, rows, embs @ q)
+        return scores
+
     def search_candidates(
         self,
         query_embedding: np.ndarray,
         target_category: Optional[str] = None,
         candidate_pool_size: int = 80,
-    ) -> List[Tuple[str, float]]:
-        """Retrieve candidate products for reranking with category-aware indexing.
+        target_item: Optional[str] = None,
+    ) -> List[Tuple[str, float, float]]:
+        """Candidate products for one detected item, restricted to that item's category.
 
-        Prioritizes candidates matching target_category and compatible categories,
-        ensuring queries for jackets or t-shirts are not crowded out by boots.
+        Returns (product_id, cosine_similarity, ranking_score) ordered by ranking score.
+
+        A shirt query returns shirts, a skirt query skirts. Products outside the category enter
+        the pool only when they are near-duplicates of the query image (similarity >= 0.97), so
+        an exact catalog image is never lost to a wrong category estimate.
         """
         if self.faiss_index is None or len(self.product_ids) == 0:
             return []
+        if not target_category or not self.metadata or self.embeddings is None:
+            return [(pid, sim, sim) for pid, sim in self.search(query_embedding, top_k=candidate_pool_size)]
 
-        # If no target category or no metadata, fall back to global FAISS search
-        if not target_category or not self.metadata:
-            return self.search(query_embedding, top_k=candidate_pool_size)
+        sims = self.similarities(query_embedding)       # plain cosine: reported and used for duplicates
+        scores = self.ranking_scores(query_embedding)   # domain-centred: used for ordering
+        preferred, _ = self.CATEGORY_POOL.get(target_category, ([target_category], []))
+        in_category = np.isin(self._categories, preferred) | np.isin(self._alt_categories, preferred)
+        if target_category == "Accessory" and target_item:
+            same_item = in_category & (self._item_names == target_item)
+            if same_item.sum() >= 3:
+                in_category = same_item
 
-        compatibility_map = {
-            "Jacket / Outerwear": {
-                "preferred": ["Jacket / Outerwear"],
-                "compatible": ["Top / T-shirt"],
-            },
-            "Top / T-shirt": {
-                "preferred": ["Top / T-shirt"],
-                "compatible": ["Jacket / Outerwear"],
-            },
-            "Pants / Trousers": {
-                "preferred": ["Pants / Trousers"],
-                "compatible": ["Skirt"],
-            },
-            "Dress": {
-                "preferred": ["Dress"],
-                "compatible": ["Skirt"],
-            },
-            "Skirt": {
-                "preferred": ["Skirt"],
-                "compatible": ["Pants / Trousers", "Dress"],
-            },
-            "Footwear": {
-                "preferred": ["Footwear"],
-                "compatible": [],
-            },
-            "Bag / Handbag": {
-                "preferred": ["Bag / Handbag"],
-                "compatible": [],
-            },
-        }
+        order = np.argsort(-scores)
+        picked = [int(i) for i in order if in_category[i]][:candidate_pool_size]
+        chosen = set(picked)
+        for i in np.argsort(-sims)[:10]:
+            if sims[i] < 0.97:
+                break
+            if int(i) not in chosen:
+                picked.append(int(i))
+        if len(picked) < 3:  # nothing of this category in the catalog: fall back to closest overall
+            picked = [int(i) for i in order[:candidate_pool_size]]
+        picked.sort(key=lambda i: -scores[i])
+        return [(self.product_ids[i], float(sims[i]), float(scores[i])) for i in picked]
 
-        rules = compatibility_map.get(target_category, {"preferred": [target_category], "compatible": []})
-        preferred_cats = set(rules.get("preferred", []))
-        compatible_cats = set(rules.get("compatible", []))
-
-        # Perform inner-product similarity search across the catalog
-        if self.embeddings is not None:
-            if query_embedding.ndim == 1:
-                q_vec = query_embedding.astype(np.float32)
-            else:
-                q_vec = query_embedding[0].astype(np.float32)
-
-            all_sims = self.embeddings @ q_vec
-
-            preferred_items = []
-            compatible_items = []
-            other_items = []
-
-            for idx, sim in enumerate(all_sims):
-                pid = self.product_ids[idx]
-                cat = self.metadata.get(pid, {}).get("category", "")
-                if cat in preferred_cats:
-                    preferred_items.append((pid, float(sim)))
-                elif cat in compatible_cats:
-                    compatible_items.append((pid, float(sim)))
-                else:
-                    other_items.append((pid, float(sim)))
-
-            preferred_items.sort(key=lambda x: x[1], reverse=True)
-            compatible_items.sort(key=lambda x: x[1], reverse=True)
-            other_items.sort(key=lambda x: x[1], reverse=True)
-
-            # Assemble candidate pool: prioritized preferred and compatible items
-            target_quota = min(len(preferred_items), int(candidate_pool_size * 0.70))
-            compat_quota = min(len(compatible_items), int(candidate_pool_size * 0.25))
-
-            candidates = preferred_items[:target_quota] + compatible_items[:compat_quota]
-            remaining = candidate_pool_size - len(candidates)
-            if remaining > 0:
-                extra = preferred_items[target_quota:] + compatible_items[compat_quota:]
-                candidates.extend(extra[:remaining])
-                remaining = candidate_pool_size - len(candidates)
-                if remaining > 0:
-                    candidates.extend(other_items[:remaining])
-
-            return candidates
-
-        return self.search(query_embedding, top_k=candidate_pool_size)
-
-    def search_with_category(
-        self,
-        query_embedding: np.ndarray,
-        target_category: Optional[str] = None,
-        top_k: int = 5,
-        strict_category: bool = False,
-    ) -> List[Tuple[str, float]]:
-        """Search products with category filtering and category-aware prioritization.
-
-        Args:
-            query_embedding: Query embedding vector
-            target_category: Optional target garment category to filter/boost
-            top_k: Number of final results
-            strict_category: If True, only returns exact category matches if available
-
-        Returns:
-            List of (product_id, similarity) tuples
-        """
-        # Retrieve candidate pool using category-aware search
-        candidate_k = min(len(self.product_ids), max(top_k * 8, 60))
-        candidates = self.search_candidates(query_embedding, target_category=target_category, candidate_pool_size=candidate_k)
-
-        if not target_category or not self.metadata:
-            return candidates[:top_k]
-
-        matched_candidates = []
-        compatible_candidates = []
-        other_candidates = []
-
-        compatibility_map = {
-            "Jacket / Outerwear": ["Jacket / Outerwear", "Top / T-shirt"],
-            "Top / T-shirt": ["Top / T-shirt", "Jacket / Outerwear"],
-            "Pants / Trousers": ["Pants / Trousers", "Skirt"],
-            "Skirt": ["Skirt", "Pants / Trousers", "Dress"],
-            "Dress": ["Dress", "Skirt"],
-            "Footwear": ["Footwear"],
-            "Bag / Handbag": ["Bag / Handbag"],
-        }
-        allowed = compatibility_map.get(target_category, [target_category])
-
-        for pid, sim in candidates:
-            item_meta = self.metadata.get(pid, {})
-            cat = item_meta.get("category", "")
-
-            if cat == target_category:
-                matched_candidates.append((pid, sim))
-            elif cat in allowed:
-                compatible_candidates.append((pid, sim))
-            else:
-                other_candidates.append((pid, sim))
-
-        if strict_category:
-            if len(matched_candidates) < top_k and candidate_k < len(self.product_ids):
-                # Full catalog exact match search
-                all_sims = self.embeddings @ (query_embedding.flatten().astype(np.float32))
-                exact_items = [
-                    (self.product_ids[i], float(all_sims[i]))
-                    for i in range(len(self.product_ids))
-                    if self.metadata.get(self.product_ids[i], {}).get("category") == target_category
-                ]
-                exact_items.sort(key=lambda x: x[1], reverse=True)
-                return exact_items[:top_k]
-            return matched_candidates[:top_k]
-
-        combined = matched_candidates + compatible_candidates
-        if len(combined) < top_k:
-            combined = combined + other_candidates
-
-        return combined[:top_k]
+    def color_similarity(self, product_id: str, query_hist: Optional[np.ndarray]) -> Optional[float]:
+        """Histogram intersection (0..1) between a query crop and a product's garment colors."""
+        if query_hist is None or getattr(self, "color_hists", None) is None:
+            return None
+        row = self._row_of.get(product_id)
+        if row is None:
+            return None
+        return float(np.minimum(self.color_hists[row], query_hist).sum())
 
     def get_metadata(self, product_id: str) -> Optional[dict]:
         """Get metadata for a product."""

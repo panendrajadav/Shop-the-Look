@@ -22,6 +22,10 @@ VALIDATION_FILE = DATA_DIR / "validation.jsonl"
 PRODUCTS_METADATA_FILE = EMBEDDINGS_DIR / "products_metadata.json"
 PRODUCTS_EMBEDDINGS_FILE = EMBEDDINGS_DIR / "products_embeddings.npy"
 PRODUCTS_INDEX_FILE = EMBEDDINGS_DIR / "products_faiss.index"
+PRODUCTS_VIEWS_FILE = EMBEDDINGS_DIR / "products_views.npz"
+PRODUCTS_COLOR_FILE = EMBEDDINGS_DIR / "products_color_hist.npy"
+QUERY_MEAN_FILE = EMBEDDINGS_DIR / "query_domain_mean.npy"
+SCENE_QUERY_CACHE = RESULTS_DIR / "scene_queries.pkl"
 
 # Model configuration
 MODEL_NAME = "ViT-B-32"
@@ -46,7 +50,7 @@ DEFAULT_TOP_K = 3
 MAX_TOP_K = 20
 
 # Validation configuration
-VALIDATION_RECALL_KS = [1, 5, 10]
+VALIDATION_RECALL_KS = [1, 5, 10, 20]
 
 # Enable debug logging
 DEBUG = os.environ.get("DEBUG", "False").lower() == "true"

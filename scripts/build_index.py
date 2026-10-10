@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
-"""Build the product catalog index, embeddings, and FAISS vector index."""
+"""Build the product catalog index, embeddings, and FAISS vector index.
+
+Only products listed in the catalog file are indexed. Validation labels are never
+read here, so nothing from validation.jsonl can leak into the searchable index.
+"""
 
 import sys
+import json
+import time
 import argparse
 import logging
 from pathlib import Path
-from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
+import torch
+from PIL import Image
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import (
-    PRODUCT_CATALOG_FILE, VALIDATION_FILE, EMBEDDINGS_DIR, IMAGES_DIR,
+    PRODUCT_CATALOG_FILE, VALIDATION_FILE, IMAGES_DIR,
     PRODUCTS_METADATA_FILE, PRODUCTS_EMBEDDINGS_FILE, PRODUCTS_INDEX_FILE,
     MODEL_NAME, PRETRAINED, DEVICE, EMBEDDING_BATCH_SIZE, DOWNLOAD_MAX_WORKERS
 )
@@ -20,6 +28,9 @@ from src.data_loader import ProductCatalogLoader, ValidationLoader
 from src.image_downloader import ImageDownloader
 from src.image_encoder import CLIPImageEncoder
 from src.catalog_index import ProductIndex
+from enrich_catalog_metadata import enrich_catalog
+from build_product_views import build_product_views
+from build_query_stats import build_query_stats
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -27,157 +38,117 @@ logger = logging.getLogger(__name__)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Build product catalog index")
-    parser.add_argument("--limit", type=int, default=1500, help="Max unique catalog products to index (default: 1500; use 0 for all 28k)")
-    parser.add_argument("--smoke-test", action="store_true", help="Run in tiny smoke test mode (50 products)")
-    parser.add_argument("--download-scenes", action="store_true", default=True, help="Download validation scenes for evaluation")
+    parser.add_argument("--limit", type=int, default=0, help="Max unique catalog products to index (default 0 = all)")
+    parser.add_argument("--cached-only", action="store_true", help="Skip downloading; index only images already in the local cache")
+    parser.add_argument("--max-minutes", type=float, default=0, help="Stop encoding after this many minutes and save what is done (0 = no limit)")
     parser.add_argument("--workers", type=int, default=DOWNLOAD_MAX_WORKERS, help="Parallel download threads")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    limit = 50 if args.smoke_test else (None if args.limit == 0 else args.limit)
 
-    logger.info("=" * 60)
-    logger.info(f"BUILDING PRODUCT CATALOG INDEX (Mode: {'SMOKE TEST' if args.smoke_test else f'LIMIT={limit}'})")
-    logger.info("=" * 60)
-
-    # 1. Load catalog
-    logger.info("1. Ingesting product catalog...")
+    # 1. Load catalog (the only source of indexable product IDs)
     catalog_loader = ProductCatalogLoader(PRODUCT_CATALOG_FILE)
     catalog_loader.load()
-    unique_catalog_ids = list(catalog_loader.get_unique_products())
-    logger.info(f"Total catalog records: {len(catalog_loader.products)}")
-    logger.info(f"Unique product IDs: {len(unique_catalog_ids)}")
+    catalog_ids = sorted(catalog_loader.get_unique_products())
+    catalog_set = set(catalog_ids)
+    logger.info(f"Catalog records: {len(catalog_loader.products)} | unique product IDs: {len(catalog_ids)}")
 
-    # 2. Load validation set to ensure ground-truth products are included
-    logger.info("2. Ingesting validation relationships...")
-    val_loader = ValidationLoader(VALIDATION_FILE)
-    val_loader.load()
-    val_products = val_loader.get_all_products()
-    val_scenes = list(val_loader.get_all_scenes())
-
-    # Priority set: all validation products (including CDN-available validation items)
-    val_in_catalog = [p for p in val_products if p in catalog_loader.get_unique_products()]
-    logger.info(f"Validation products in catalog: {len(val_in_catalog)} / {len(val_products)} (Remaining {len(val_products)-len(val_in_catalog)} available via CDN)")
-
-    # Combine validation products with catalog products to form target set
-    target_products = []
-    seen = set()
-    # Always include ALL 206 validation ground truth items first for 100% benchmark coverage
-    for pid in sorted(val_products):
-        target_products.append(pid)
-        seen.add(pid)
-
-    # Add remaining catalog items up to limit
-    for pid in unique_catalog_ids:
-        if pid not in seen:
-            target_products.append(pid)
-            seen.add(pid)
-            if limit and len(target_products) >= limit:
-                break
-
-    logger.info(f"Target products to download and index: {len(target_products)}")
-
-    # 3. Download images concurrently
-    logger.info("3. Downloading and validating product images...")
-    downloader = ImageDownloader(IMAGES_DIR, max_workers=args.workers)
-    product_image_paths = downloader.download_images_parallel(target_products, max_workers=args.workers)
-
-    # Download validation scene images
-    if args.download_scenes:
-        logger.info(f"4. Downloading {len(val_scenes)} validation scene images for benchmark...")
-        scene_paths = downloader.download_images_parallel(val_scenes, max_workers=args.workers)
-        logger.info(f"Accessible scene images: {len(scene_paths)} / {len(val_scenes)}")
-
-    downloader.save_stats()
-    download_stats = downloader.get_stats()
-    logger.info(f"Download statistics: {download_stats}")
-
-    # 4. Filter products that have valid local images
-    valid_products = []
-    valid_paths = []
-    for pid in target_products:
-        path = product_image_paths.get(pid)
-        if path and Path(path).exists() and Path(path).stat().st_size > 0:
-            valid_products.append(pid)
-            valid_paths.append(Path(path))
-
-    logger.info(f"Valid product images ready for embedding: {len(valid_products)}")
-
-    # 5. Encode images with CLIP in batches
-    logger.info(f"5. Encoding images with OpenCLIP ({MODEL_NAME}) on {DEVICE}...")
-    encoder = CLIPImageEncoder(model_name=MODEL_NAME, pretrained=PRETRAINED, device=DEVICE)
-
+    # 2. Reuse embeddings from a previous run (catalog products only)
     product_embeddings = {}
     product_metadata = {}
-
-    # Load previously computed embeddings and metadata for resumability
     if PRODUCTS_EMBEDDINGS_FILE.exists() and PRODUCTS_METADATA_FILE.exists():
         try:
-            import json
             existing_embs = np.load(PRODUCTS_EMBEDDINGS_FILE)
             with open(PRODUCTS_METADATA_FILE, "r", encoding="utf-8") as f:
                 meta_json = json.load(f)
-            prev_pids = meta_json.get("product_ids", [])
-            prev_meta = meta_json.get("metadata", {})
-            for pid, emb in zip(prev_pids, existing_embs):
-                product_embeddings[pid] = emb
-                product_metadata[pid] = prev_meta.get(pid, {"product_id": pid})
-            logger.info(f"Loaded {len(product_embeddings)} existing embeddings for resumable indexing.")
+            for pid, emb in zip(meta_json.get("product_ids", []), existing_embs):
+                if pid in catalog_set:
+                    product_embeddings[pid] = emb
+                    product_metadata[pid] = meta_json.get("metadata", {}).get(pid, {"product_id": pid})
+            logger.info(f"Reusing {len(product_embeddings)} existing catalog embeddings.")
         except Exception as e:
             logger.warning(f"Could not load previous embeddings: {e}")
 
-    # Only encode products not already present in embeddings cache
-    to_encode_paths = []
-    to_encode_pids = []
-    for pid, path in zip(valid_products, valid_paths):
-        if pid not in product_embeddings:
-            to_encode_pids.append(pid)
-            to_encode_paths.append(path)
+    target_products = [p for p in catalog_ids if p in product_embeddings] + \
+                      [p for p in catalog_ids if p not in product_embeddings]
+    if args.limit:
+        target_products = target_products[:args.limit]
 
-    logger.info(f"New product images to encode: {len(to_encode_paths)}")
+    # 3. Resolve images (download unless --cached-only)
+    downloader = ImageDownloader(IMAGES_DIR, max_workers=args.workers)
+    if args.cached_only:
+        image_paths = {}
+        for pid in target_products:
+            path = downloader.get_cached_image(pid)
+            if path:
+                image_paths[pid] = path
+    else:
+        image_paths = downloader.download_images_parallel(target_products, max_workers=args.workers)
+        val_loader = ValidationLoader(VALIDATION_FILE)
+        val_loader.load()
+        scene_paths = downloader.download_images_parallel(sorted(val_loader.get_all_scenes()), max_workers=args.workers)
+        logger.info(f"Scene images available (queries only, never indexed): {len(scene_paths)}")
+        logger.info(f"Download statistics: {downloader.get_stats()}")
+    logger.info(f"Catalog images available locally: {len(image_paths)} / {len(target_products)}")
 
-    total_images = len(to_encode_paths)
-    for i in range(0, total_images, EMBEDDING_BATCH_SIZE):
-        batch_paths = to_encode_paths[i : i + EMBEDDING_BATCH_SIZE]
-        batch_pids = to_encode_pids[i : i + EMBEDDING_BATCH_SIZE]
+    # 4. Encode images not yet embedded
+    to_encode = [(pid, Path(image_paths[pid])) for pid in target_products
+                 if pid in image_paths and pid not in product_embeddings]
+    logger.info(f"New product images to encode: {len(to_encode)} with OpenCLIP {MODEL_NAME} on {DEVICE}")
+    encoder = CLIPImageEncoder(model_name=MODEL_NAME, pretrained=PRETRAINED, device=DEVICE)
 
-        if i % (EMBEDDING_BATCH_SIZE * 5) == 0:
-            logger.info(f"  Encoding progress: {i}/{total_images} ({(i/max(1, total_images)):.1%})")
+    def _load(item):
+        try:
+            return encoder.preprocess(Image.open(item[1]).convert("RGB"))
+        except Exception:
+            return None
 
-        batch_result = encoder.encode_batch(batch_paths, batch_size=len(batch_paths))
-
-        for pid, path in zip(batch_pids, batch_paths):
-            emb = batch_result.get(path)
-            if emb is not None:
+    start = time.time()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for i in range(0, len(to_encode), EMBEDDING_BATCH_SIZE):
+            if args.max_minutes and (time.time() - start) > args.max_minutes * 60:
+                logger.info(f"Time budget reached after {i} images; saving partial index.")
+                break
+            batch = to_encode[i:i + EMBEDDING_BATCH_SIZE]
+            tensors = list(pool.map(_load, batch))
+            keep = [(item, t) for item, t in zip(batch, tensors) if t is not None]
+            if not keep:
+                continue
+            with torch.no_grad():
+                feats = encoder.model.encode_image(torch.stack([t for _, t in keep]).to(encoder.device))
+                feats = feats / feats.norm(dim=-1, keepdim=True)
+            for (pid, path), emb in zip([k[0] for k in keep], feats.cpu().numpy().astype(np.float32)):
                 product_embeddings[pid] = emb
                 product_metadata[pid] = {
                     "product_id": pid,
                     "image_path": str(path),
                     "catalog_frequency": catalog_loader.get_duplicate_count(pid),
                 }
+            if (i // EMBEDDING_BATCH_SIZE) % 20 == 0:
+                rate = (i + len(batch)) / max(1e-6, time.time() - start)
+                logger.info(f"  Encoded {i + len(batch)}/{len(to_encode)} ({rate:.1f} img/s)")
 
-    logger.info(f"Successfully assembled visual embeddings: {len(product_embeddings)}")
-
-    # 6. Build FAISS Index and persist
-    logger.info("6. Building FAISS Inner Product index and persisting artifacts...")
+    # 5. Build FAISS index and persist
     index = ProductIndex(PRODUCTS_EMBEDDINGS_FILE, PRODUCTS_METADATA_FILE, PRODUCTS_INDEX_FILE)
     num_indexed = index.build_index(product_embeddings, product_metadata)
     index.save()
 
+    # 6. Category / pattern / colour attributes for every indexed product
+    enrich_catalog()
+
+    # 7. Garment-level views for products photographed on a model
+    build_product_views()
+
+    # 8. Query-domain mean for domain centring (scene images only, no labels)
+    build_query_stats()
+
+    assert set(index.product_ids) <= catalog_set, "Index contains a non-catalog product"
     logger.info("=" * 60)
-    logger.info("BUILD SUMMARY")
-    logger.info("=" * 60)
-    logger.info(f"Total catalog records:         {len(catalog_loader.products)}")
-    logger.info(f"Unique catalog IDs:            {len(unique_catalog_ids)}")
-    logger.info(f"Target products processed:     {len(target_products)}")
-    logger.info(f"Valid images downloaded:       {len(valid_products)}")
-    logger.info(f"Embeddings generated:          {len(product_embeddings)}")
-    logger.info(f"FAISS index size:              {num_indexed} products")
-    logger.info(f"Embeddings saved to:           {PRODUCTS_EMBEDDINGS_FILE}")
-    logger.info(f"Metadata saved to:             {PRODUCTS_METADATA_FILE}")
-    logger.info(f"FAISS index saved to:          {PRODUCTS_INDEX_FILE}")
+    logger.info(f"Unique catalog IDs:        {len(catalog_ids)}")
+    logger.info(f"Images available locally:  {len(image_paths)}")
+    logger.info(f"FAISS index size:          {num_indexed} products")
     logger.info("=" * 60)
 
 

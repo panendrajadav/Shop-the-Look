@@ -115,7 +115,7 @@ def load_sample_scenes():
     try:
         val_loader = ValidationLoader(VALIDATION_FILE)
         val_loader.load()
-        scenes = list(val_loader.get_all_scenes())
+        scenes = sorted(val_loader.get_all_scenes())
         return scenes, val_loader.scene_to_products
     except Exception:
         return [], {}
@@ -141,7 +141,7 @@ def render_product_card(exp: dict):
         with col_info:
             is_exact = exp.get("is_exact_match", False)
             badge_html = (
-                '<span class="badge-exact">Verified Exact Match</span>'
+                '<span class="badge-exact">Exact Match</span>'
                 if is_exact
                 else '<span class="badge-similar">Visually Similar</span>'
             )
@@ -160,13 +160,19 @@ def render_product_card(exp: dict):
             st.markdown(
                 f'<span class="tag">Category: {cat_label}</span>'
                 f'<span class="tag">Color: {color_label}</span>'
-                f'<span class="tag">Pattern: {pat_label}</span>',
+                f'<span class="tag">Pattern: {pat_label}</span>'
+                f'<span class="tag">Style: {exp.get("style", "N/A")}</span>'
+                f'<span class="tag">Material: {exp.get("material", "N/A")}</span>',
                 unsafe_allow_html=True
             )
 
             summary_text = exp.get("summary", "")
             if summary_text:
                 st.write(f"*{summary_text}*")
+            if exp.get("shared"):
+                st.write("**Matches the query on:** " + "; ".join(exp["shared"]))
+            if exp.get("differs"):
+                st.write("**Differs on:** " + "; ".join(exp["differs"]))
 
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -230,7 +236,7 @@ def main():
             if sample_scenes:
                 selected_idx = st.selectbox(
                     "Select a benchmark scene:",
-                    options=range(min(len(sample_scenes), 50)),
+                    options=range(len(sample_scenes)),
                     format_func=lambda i: f"Scene #{i+1} ({sample_scenes[i][:8]}...)"
                 )
                 current_scene_id = sample_scenes[selected_idx]
@@ -284,19 +290,42 @@ def main():
             st.warning("No individual garments could be isolated from this image.")
         else:
             # Garment Selector
-            options = list(range(len(detected_garments)))
-            labels = [
-                f"{g.get('icon', '🏷️')} {g['garment_label']} ({g.get('dominant_color', '')})"
-                for g in detected_garments
+            # "Full Outfit" lists the single best catalog match for every detected item;
+            # the other options show more candidates for one item.
+            parts = [g for g in detected_garments if g["garment_label"] != "Full Outfit / Look"] or detected_garments
+            labels = ["✨ Full Outfit"] + [
+                f"{g.get('icon', '🏷️')} {g.get('item_name', g['garment_label'])} ({g.get('dominant_color', '')})"
+                for g in parts
             ]
             selected_idx = st.radio(
-                "Select a detected garment to view matches:",
-                options=options,
+                "Select the full outfit or one detected item:",
+                options=list(range(len(labels))),
                 format_func=lambda i: labels[i],
                 horizontal=True
             )
 
-            selected_garment = detected_garments[selected_idx]
+            if selected_idx == 0:
+                st.markdown("#### Best catalog match for each detected item")
+                for g in parts:
+                    if not g.get("recommendations"):
+                        continue
+                    best = explainer.explain_batch(
+                        results=g["recommendations"],
+                        query_image=g["crop_image"],
+                        query_category=g["garment_label"],
+                    )[0]
+                    kind = "exact match" if best["is_exact_match"] else "most similar product"
+                    st.markdown(
+                        f"**{g.get('icon', '')} {g.get('item_name', g['garment_label'])}** "
+                        f"({g.get('dominant_color', 'N/A')}): {kind}"
+                    )
+                    st.image(g["crop_image"], caption="Detected in photo", width=110)
+                    render_product_card(best)
+                selected_garment = None
+            else:
+                selected_garment = parts[selected_idx - 1]
+
+        if query_image is not None and detected_garments and selected_garment is not None:
 
             # Display selected garment crop and attributes
             g_col1, g_col2 = st.columns([1, 2], gap="medium")
@@ -307,7 +336,8 @@ def main():
                     use_container_width=True
                 )
             with g_col2:
-                st.write(f"**Garment:** {selected_garment.get('icon', '')} {selected_garment['garment_label']}")
+                st.write(f"**Detected item:** {selected_garment.get('icon', '')} {selected_garment.get('item_name', selected_garment['garment_label'])}")
+                st.write(f"**Category:** {selected_garment['garment_label']}")
                 st.write(f"**Dominant Color:** `{selected_garment.get('dominant_color', 'N/A')}`")
                 pat = selected_garment.get("pattern")
                 if pat:
@@ -326,10 +356,32 @@ def main():
                     results=recs,
                     query_image=selected_garment["crop_image"],
                     query_category=selected_garment["garment_label"],
-                    ground_truth_ids=known_gt_ids
                 )
+                if not any(e["is_exact_match"] for e in explanations):
+                    st.info("No exact catalog match found for this garment. Showing the most visually similar products.")
                 for exp in explanations:
                     render_product_card(exp)
+
+    # 4b. Benchmark answer for validation scenes. Shown for manual checking only:
+    # these labels are never passed to the detector, ranker, or match badges above.
+    if current_scene_id and query_image is not None:
+        st.markdown("---")
+        with st.expander("🎯 Benchmark answer for this scene (validation label, not used for predictions)", expanded=False):
+            indexed = set(index.product_ids)
+            shown = {r[0] for g in detected_garments for r in g.get("recommendations", [])}
+            gt_cols = st.columns(max(len(known_gt_ids), 3))
+            for g_col, gt_id in zip(gt_cols, sorted(known_gt_ids)):
+                with g_col:
+                    gt_path = downloader.get_cached_image(gt_id)
+                    if gt_path:
+                        st.image(Image.open(gt_path).convert("RGB"), width=180)
+                    st.caption(f"`{gt_id}`")
+                    if gt_id not in indexed:
+                        st.write("Not in the indexed catalog: only similar products can be returned.")
+                    elif gt_id in shown:
+                        st.write("✅ Retrieved in the results above.")
+                    else:
+                        st.write("❌ In the catalog but not in the top results.")
 
     # 5. Optional Developer Diagnostics (Collapsed by Default)
     if query_image is not None and detected_garments:
@@ -375,7 +427,10 @@ def main():
                     m2.metric("Recall @ 5", f"{metrics.get('recall@5', 0.0):.4f}")
                     m3.metric("Recall @ 10", f"{metrics.get('recall@10', 0.0):.4f}")
                     m4.metric("MRR", f"{metrics.get('mrr', 0.0):.4f}")
-                    st.caption("Evaluated on 282 eligible scenes from `validation.jsonl` using OpenCLIP ViT-B/32.")
+                    st.caption(
+                        f"Evaluated on {metrics.get('num_evaluated_scenes', 0)} scenes from `validation.jsonl` "
+                        f"against {index.get_size():,} indexed catalog products using OpenCLIP {MODEL_NAME}."
+                    )
             except Exception as e:
                 st.caption(f"Could not load evaluation metrics: {e}")
 

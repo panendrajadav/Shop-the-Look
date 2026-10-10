@@ -2,6 +2,7 @@
 """Run quantitative evaluation on the validation dataset."""
 
 import sys
+import argparse
 import logging
 from pathlib import Path
 
@@ -11,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import (
     PRODUCTS_METADATA_FILE, PRODUCTS_EMBEDDINGS_FILE, PRODUCTS_INDEX_FILE,
     VALIDATION_FILE, IMAGES_DIR, MODEL_NAME, PRETRAINED, DEVICE,
-    VALIDATION_RECALL_KS, EVAL_RESULTS_JSON, EVAL_RESULTS_CSV
+    VALIDATION_RECALL_KS, EVAL_RESULTS_JSON, EVAL_RESULTS_CSV, RESULTS_DIR
 )
 from src.data_loader import ValidationLoader
 from src.image_downloader import ImageDownloader
@@ -24,6 +25,11 @@ logger = logging.getLogger(__name__)
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Evaluate retrieval on validation.jsonl")
+    parser.add_argument("--reuse-queries", action="store_true",
+                        help="Reuse cached detections and query embeddings (valid only if detection/encoding code is unchanged)")
+    args = parser.parse_args()
+
     logger.info("=" * 60)
     logger.info("EVALUATING VISUAL RETRIEVAL PERFORMANCE")
     logger.info("=" * 60)
@@ -62,6 +68,8 @@ def main():
         catalog_index=index,
         garment_detector=detector,
         recalls_at=VALIDATION_RECALL_KS,
+        query_cache=RESULTS_DIR / "scene_queries.pkl",
+        reuse_queries=args.reuse_queries,
     )
 
     results = pipeline.evaluate(
@@ -74,6 +82,8 @@ def main():
 
     # 7. Save outputs
     pipeline.evaluator.save_results(json_path=EVAL_RESULTS_JSON, csv_path=EVAL_RESULTS_CSV)
+    pipeline.save_breakdown(RESULTS_DIR / "scene_breakdown.csv")
+    logger.info(f"Per-scene breakdown saved to: {RESULTS_DIR / 'scene_breakdown.csv'}")
     logger.info(f"Evaluation report saved to: {EVAL_RESULTS_JSON}")
     logger.info(f"Per-scene predictions CSV saved to: {EVAL_RESULTS_CSV}")
     logger.info("=" * 60)
