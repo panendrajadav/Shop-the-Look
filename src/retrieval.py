@@ -1,6 +1,6 @@
 import logging
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Any
 import numpy as np
 from PIL import Image
 import torch
@@ -9,82 +9,92 @@ from src.garment_detector import GarmentDetector
 
 logger = logging.getLogger(__name__)
 
+# Category compatibility matrix: maps query category to compatible categories
+CATEGORY_COMPATIBILITY = {
+    "Jacket / Outerwear": {
+        "preferred": ["Jacket / Outerwear"],
+        "compatible": [],
+        "forbidden": ["Footwear", "Skirt", "Dress", "Bag / Handbag", "Pants / Trousers"],
+    },
+    "Top / T-shirt": {
+        "preferred": ["Top / T-shirt"],
+        "compatible": [],
+        "forbidden": ["Jacket / Outerwear", "Footwear", "Pants / Trousers", "Skirt", "Bag / Handbag", "Dress"],
+    },
+    "Pants / Trousers": {
+        "preferred": ["Pants / Trousers"],
+        "compatible": [],
+        "forbidden": ["Skirt", "Jacket / Outerwear", "Top / T-shirt", "Footwear", "Bag / Handbag", "Dress"],
+    },
+    "Dress": {
+        "preferred": ["Dress"],
+        "compatible": ["Skirt"],
+        "forbidden": ["Pants / Trousers", "Footwear", "Bag / Handbag", "Jacket / Outerwear"],
+    },
+    "Skirt": {
+        "preferred": ["Skirt"],
+        "compatible": ["Dress"],
+        "forbidden": ["Pants / Trousers", "Jacket / Outerwear", "Top / T-shirt", "Footwear", "Bag / Handbag"],
+    },
+    "Footwear": {
+        "preferred": ["Footwear"],
+        "compatible": [],
+        "forbidden": ["Jacket / Outerwear", "Top / T-shirt", "Pants / Trousers", "Dress", "Skirt", "Bag / Handbag"],
+    },
+    "Bag / Handbag": {
+        "preferred": ["Bag / Handbag"],
+        "compatible": [],
+        "forbidden": ["Footwear", "Pants / Trousers", "Jacket / Outerwear", "Dress", "Skirt", "Top / T-shirt"],
+    },
+}
+
+COLOR_HARMONY = {
+    "Black": {"compatible": ["Black", "Dark Grey", "Grey"], "clashing": ["Pink", "Maroon / Burgundy", "Red", "Yellow / Gold", "Orange"]},
+    "Dark Grey": {"compatible": ["Dark Grey", "Black", "Grey"], "clashing": ["Pink", "Red", "Yellow / Gold", "Orange"]},
+    "Grey": {"compatible": ["Grey", "Light Grey", "Dark Grey", "Black"], "clashing": ["Pink", "Red", "Maroon / Burgundy", "Orange", "Brown / Tan"]},
+    "Light Grey": {"compatible": ["Light Grey", "Grey", "White"], "clashing": ["Brown / Tan", "Maroon / Burgundy", "Red", "Pink", "Orange"]},
+    "White": {"compatible": ["White", "Light Grey", "Beige / Khaki"], "clashing": []},
+    "Navy / Dark Blue": {"compatible": ["Navy / Dark Blue", "Blue", "Black", "Dark Grey"], "clashing": ["Yellow / Gold", "Red", "Pink", "Orange"]},
+    "Blue": {"compatible": ["Blue", "Navy / Dark Blue", "Light Blue"], "clashing": ["Red", "Orange", "Pink", "Maroon / Burgundy"]},
+    "Light Blue": {"compatible": ["Light Blue", "Blue", "White"], "clashing": ["Maroon / Burgundy", "Brown / Tan"]},
+    "Red": {"compatible": ["Red", "Maroon / Burgundy"], "clashing": ["Green", "Olive / Dark Green", "Blue", "Pink"]},
+    "Maroon / Burgundy": {"compatible": ["Maroon / Burgundy", "Red", "Brown / Tan"], "clashing": ["Light Grey", "Grey", "Blue", "Green", "Pink"]},
+    "Brown / Tan": {"compatible": ["Brown / Tan", "Beige / Khaki", "Black"], "clashing": ["Pink", "Light Blue", "Purple"]},
+    "Beige / Khaki": {"compatible": ["Beige / Khaki", "White", "Brown / Tan"], "clashing": ["Pink", "Purple"]},
+    "Green": {"compatible": ["Green", "Olive / Dark Green", "Dark Grey"], "clashing": ["Red", "Pink", "Maroon / Burgundy"]},
+    "Olive / Dark Green": {"compatible": ["Olive / Dark Green", "Green", "Black", "Dark Grey"], "clashing": ["Red", "Pink", "Maroon / Burgundy"]},
+    "Pink": {"compatible": ["Pink", "White"], "clashing": ["Black", "Dark Grey", "Olive / Dark Green", "Brown / Tan"]},
+    "Purple": {"compatible": ["Purple", "Dark Grey", "Black"], "clashing": ["Yellow / Gold", "Orange", "Green"]},
+    "Yellow / Gold": {"compatible": ["Yellow / Gold", "White"], "clashing": ["Navy / Dark Blue", "Purple", "Black"]},
+    "Orange": {"compatible": ["Orange", "Brown / Tan"], "clashing": ["Navy / Dark Blue", "Blue", "Purple"]},
+}
+
 
 def _generate_scene_crops(image: Image.Image) -> List[Tuple[str, Image.Image]]:
-    """Generate multiple overlapping crops from a scene image.
-
-    This multi-crop strategy bridges the domain gap between lifestyle scene images
-    and isolated product catalog images by extracting focused regions that better
-    match how products appear in the catalog.
-
-    Returns:
-        List of (crop_name, PIL.Image) tuples
-    """
+    """Generate multi-crop views of a scene for full-scene matching."""
     w, h = image.size
-    crops = []
+    crops = [("full", image)]
 
-    # Full image (baseline)
-    crops.append(("full", image))
-
-    # Center crop — product is often in the center
+    # Center crop
     cx, cy = w // 2, h // 2
-    crop_w, crop_h = int(w * 0.6), int(h * 0.7)
-    x1 = max(0, cx - crop_w // 2)
-    y1 = max(0, cy - crop_h // 2)
-    x2 = min(w, cx + crop_w // 2)
-    y2 = min(h, cy + crop_h // 2)
+    crop_w, crop_h = int(w * 0.65), int(h * 0.75)
+    x1, y1 = max(0, cx - crop_w // 2), max(0, cy - crop_h // 2)
+    x2, y2 = min(w, cx + crop_w // 2), min(h, cy + crop_h // 2)
     crops.append(("center", image.crop((x1, y1, x2, y2))))
 
-    # Upper body region — tops, shirts, jackets
-    crops.append(("upper", image.crop((
-        int(w * 0.1), int(h * 0.02),
-        int(w * 0.9), int(h * 0.52)
-    ))))
+    # Upper body
+    crops.append(("upper", image.crop((int(w * 0.08), int(h * 0.05), int(w * 0.92), int(h * 0.58)))))
 
-    # Lower body region — pants, skirts, shoes
-    crops.append(("lower", image.crop((
-        int(w * 0.1), int(h * 0.40),
-        int(w * 0.9), int(h * 0.95)
-    ))))
-
-    # Left half — outfit element
-    crops.append(("left", image.crop((
-        0, int(h * 0.05),
-        int(w * 0.55), int(h * 0.95)
-    ))))
-
-    # Right half — outfit element
-    crops.append(("right", image.crop((
-        int(w * 0.45), int(h * 0.05),
-        w, int(h * 0.95)
-    ))))
-
-    # Tight center (for close-up product shots in scenes)
-    crops.append(("tight_center", image.crop((
-        int(w * 0.2), int(h * 0.15),
-        int(w * 0.8), int(h * 0.85)
-    ))))
+    # Lower body
+    crops.append(("lower", image.crop((int(w * 0.10), int(h * 0.45), int(w * 0.90), int(h * 0.95)))))
 
     return crops
 
 
 class SceneRetrieval:
-    """Scene-based and garment-level visual product retrieval system.
-
-    Uses multi-crop fusion to bridge the scene-to-product domain gap:
-    multiple overlapping regions from the scene are encoded and their
-    retrieval scores are fused (max-score per product across crops)
-    for significantly better accuracy than single-shot full-scene matching.
-    """
+    """Category-aware fashion visual discovery and garment retrieval engine."""
 
     def __init__(self, encoder, catalog_index, garment_detector: Optional[GarmentDetector] = None):
-        """Initialize retrieval system.
-
-        Args:
-            encoder: CLIPImageEncoder instance
-            catalog_index: ProductIndex instance
-            garment_detector: Optional GarmentDetector instance
-        """
         self.encoder = encoder
         self.catalog_index = catalog_index
         self.garment_detector = garment_detector or GarmentDetector(clip_encoder=encoder)
@@ -103,22 +113,18 @@ class SceneRetrieval:
             return None
 
     def _encode_pil_batch(self, images: List[Image.Image]) -> List[Optional[np.ndarray]]:
-        """Batch-encode multiple PIL images for efficiency."""
-        results = []
+        """Batch-encode multiple PIL images efficiently."""
+        results = [None] * len(images)
         tensors = []
         valid_indices = []
 
         for i, img in enumerate(images):
             try:
-                img = img.convert("RGB")
-                t = self.encoder.preprocess(img)
+                t = self.encoder.preprocess(img.convert("RGB"))
                 tensors.append(t)
                 valid_indices.append(i)
             except Exception as e:
-                logger.debug(f"Could not preprocess crop {i}: {e}")
-
-        # Initialize all as None
-        results = [None] * len(images)
+                logger.debug(f"Preprocess failed for crop {i}: {e}")
 
         if not tensors:
             return results
@@ -133,155 +139,159 @@ class SceneRetrieval:
             for j, orig_idx in enumerate(valid_indices):
                 results[orig_idx] = features_np[j]
         except Exception as e:
-            logger.warning(f"Batch encoding failed: {e}")
-            # Fallback to individual encoding
+            logger.warning(f"Batch encoding failed, using fallback: {e}")
             for orig_idx in valid_indices:
                 results[orig_idx] = self._encode_pil_image(images[orig_idx])
 
         return results
 
-    def retrieve_from_embedding(
+    def rerank_candidates(
         self,
-        query_embedding: np.ndarray,
-        top_k: int = 5,
-        remove_duplicates: bool = True,
-    ) -> List[Tuple[str, float]]:
-        """Retrieve top-K products for a precomputed query embedding."""
-        if self.catalog_index.get_size() == 0:
-            logger.warning("Catalog index is empty")
-            return []
+        raw_candidates: List[Tuple[str, float]],
+        query_category: Optional[str] = None,
+        query_color: Optional[str] = None,
+        query_pattern: Optional[str] = None,
+        query_attributes: Optional[Dict[str, Any]] = None,
+        top_k: int = 3,
+    ) -> List[Tuple[str, float, float, Dict[str, Any]]]:
+        """Category-aware, pattern-calibrated, and style-grounded candidate reranking.
 
-        # Retrieve extra to account for deduplication
-        raw_results = self.catalog_index.search(query_embedding, top_k=top_k * 3)
-
-        if not remove_duplicates:
-            return raw_results[:top_k]
-
-        seen = set()
-        deduped = []
-        for pid, sim in raw_results:
-            if pid not in seen:
-                seen.add(pid)
-                deduped.append((pid, sim))
-                if len(deduped) >= top_k:
-                    break
-
-        return deduped
-
-    def retrieve_multi_crop(
-        self,
-        scene_image: Image.Image,
-        top_k: int = 5,
-        remove_duplicates: bool = True,
-    ) -> Optional[List[Tuple[str, float]]]:
-        """Multi-crop scene-level retrieval with score fusion.
-
-        Generates multiple crops from the scene image, retrieves candidates from each,
-        and fuses scores using max-score-per-product across all crops.
-        This dramatically improves recall for scene-to-product matching.
-
-        Args:
-            scene_image: PIL Image of the scene
-            top_k: Number of results to return
-            remove_duplicates: Deduplicate returned product IDs
+        Evaluates candidate products using:
+        1. Visual embedding cosine similarity (base visual signal).
+        2. Garment category compatibility (forbidding cross-category bleed like jackets for tops or pants for skirts).
+        3. Color harmony / compatibility (rewarding matching/secondary tones, penalizing clashing colors).
+        4. Pattern compatibility (prioritizing striped/patterned items, penalizing solid mismatches).
+        5. Silhouette and sleeve compatibility (rejecting black sleeveless tops or denim jackets when querying striped/gathered tops).
 
         Returns:
-            List of (product_id, max_similarity) tuples, sorted by score
+            List of (product_id, raw_cosine_sim, rerank_score, diagnostic_dict)
         """
-        if self.catalog_index.get_size() == 0:
-            return []
+        scored_candidates = []
+        rules = CATEGORY_COMPATIBILITY.get(query_category, {})
+        preferred_cats = rules.get("preferred", [])
+        compatible_cats = rules.get("compatible", [])
+        forbidden_cats = rules.get("forbidden", [])
 
-        crops = _generate_scene_crops(scene_image)
-        crop_images = [c[1] for c in crops]
+        primary_col = query_color
+        secondary_col = None
+        if query_attributes:
+            primary_col = query_attributes.get("primary_color", query_color)
+            secondary_col = query_attributes.get("secondary_color")
+            query_pattern = query_pattern or query_attributes.get("pattern")
 
-        # Batch-encode all crops efficiently
-        embeddings = self._encode_pil_batch(crop_images)
+        color_rules = COLOR_HARMONY.get(primary_col, {})
+        compat_colors = color_rules.get("compatible", [primary_col] if primary_col else [])
+        clash_colors = color_rules.get("clashing", [])
 
-        # Collect candidates from each crop and fuse by max score
-        product_best_score: Dict[str, float] = {}
-        candidates_per_crop = top_k * 3  # retrieve extra per crop
-
-        for emb in embeddings:
-            if emb is None:
+        seen_pids = set()
+        for pid, raw_sim in raw_candidates:
+            if pid in seen_pids:
                 continue
-            results = self.catalog_index.search(emb, top_k=candidates_per_crop)
-            for pid, sim in results:
-                if pid not in product_best_score or sim > product_best_score[pid]:
-                    product_best_score[pid] = sim
+            seen_pids.add(pid)
 
-        if not product_best_score:
-            return []
+            meta = self.catalog_index.get_metadata(pid) or {}
+            cand_cat = meta.get("category", "")
+            cand_color = meta.get("dominant_color", "")
+            cand_pattern = meta.get("pattern", "Solid Color")
 
-        # Sort by best score and return top-K
-        sorted_results = sorted(product_best_score.items(), key=lambda x: x[1], reverse=True)
+            # 1. Category score adjustment
+            cat_delta = 0.0
+            cat_status = "Neutral"
+            if query_category:
+                if cand_cat in preferred_cats:
+                    cat_delta = 0.12
+                    cat_status = "Exact Category Match"
+                elif cand_cat in compatible_cats:
+                    cat_delta = 0.02
+                    cat_status = "Compatible Category"
+                elif cand_cat in forbidden_cats:
+                    cat_delta = -0.35  # Strong penalty against forbidden category
+                    cat_status = "Category Mismatch"
+                else:
+                    cat_delta = -0.08
+                    cat_status = "Unverified Category"
 
-        if remove_duplicates:
-            return sorted_results[:top_k]
-        else:
-            return sorted_results[:top_k]
+            # 2. Color score adjustment
+            color_delta = 0.0
+            color_status = "Neutral"
+            if primary_col and cand_color:
+                if cand_color == primary_col:
+                    color_delta = 0.10
+                    color_status = "Exact Color Match"
+                elif secondary_col and cand_color == secondary_col:
+                    color_delta = 0.06
+                    color_status = f"Secondary Tone Match ({secondary_col})"
+                elif cand_color in compat_colors:
+                    color_delta = 0.04
+                    color_status = "Harmonious Color"
+                elif cand_color in clash_colors:
+                    color_delta = -0.20  # Penalty for clashing color
+                    color_status = "Color Clash"
 
-    def retrieve_from_scene(
-        self,
-        scene_image_path: Path,
-        top_k: int = 5,
-        remove_duplicates: bool = True,
-    ) -> Optional[List[Tuple[str, float]]]:
-        """Retrieve top-K products matching scene image using multi-crop fusion.
+            # 3. Pattern score adjustment
+            pattern_delta = 0.0
+            pattern_status = "Neutral"
+            if query_pattern:
+                if cand_pattern == query_pattern:
+                    pattern_delta = 0.10
+                    pattern_status = f"Pattern Match ({cand_pattern})"
+                elif query_pattern == "Striped" and cand_pattern == "Solid Color":
+                    pattern_delta = -0.15
+                    pattern_status = "Pattern Mismatch (Solid vs Striped)"
+                elif query_pattern == "Striped" and cand_pattern != "Striped":
+                    pattern_delta = -0.08
+                    pattern_status = f"Pattern Mismatch ({cand_pattern} vs Striped)"
+                elif query_pattern == "Solid Color" and cand_pattern != "Solid Color":
+                    pattern_delta = -0.08
+                    pattern_status = f"Pattern Mismatch ({cand_pattern} vs Solid)"
 
-        Args:
-            scene_image_path: Path to scene image
-            top_k: Number of results to return
-            remove_duplicates: Deduplicate returned product IDs
+            # 4. Style, Silhouette & Sleeve adjustment
+            style_delta = 0.0
+            style_status = "Neutral"
+            if query_attributes:
+                q_sil = query_attributes.get("silhouette")
+                q_sleeve = query_attributes.get("sleeve")
 
-        Returns:
-            List of (product_id, cosine_similarity) tuples
-        """
-        scene_path = Path(scene_image_path)
-        if not scene_path.exists():
-            logger.warning(f"Scene image path does not exist: {scene_path}")
-            return None
+                # If query is gathered/peplum top:
+                if q_sil == "Gathered / Peplum / Ruffled":
+                    if cand_cat == "Jacket / Outerwear":
+                        style_delta -= 0.15
+                        style_status = "Denim/Outerwear Mismatch for Gathered Top"
+                    elif cand_cat == "Top / T-shirt" and cand_pattern in ["Striped", "Graphic / Printed"]:
+                        style_delta += 0.06
+                        style_status = "Gathered / Peplum Silhouette Compatible"
 
-        try:
-            scene_image = Image.open(scene_path).convert("RGB")
-        except Exception as e:
-            logger.warning(f"Cannot open scene image: {e}")
-            return None
+                # If query has sleeves: penalize plain black sleeveless tops
+                if q_sleeve in ["Short Sleeve", "Long Sleeve"]:
+                    if cand_color == "Black" and cand_cat == "Top / T-shirt" and cand_pattern == "Solid Color":
+                        style_delta -= 0.15
+                        style_status = "Sleeve & Tone Mismatch (Black Sleeveless vs Sleeved Striped)"
 
-        return self.retrieve_multi_crop(scene_image, top_k=top_k, remove_duplicates=remove_duplicates)
+            # Calibrated combined score
+            rerank_score = float(raw_sim + cat_delta + color_delta + pattern_delta + style_delta)
 
-    def retrieve_from_image(
-        self,
-        image_input,
-        top_k: int = 5,
-        remove_duplicates: bool = True,
-    ) -> Optional[List[Tuple[str, float]]]:
-        """Retrieve top-K products matching a PIL Image or numpy array.
+            diag = {
+                "product_id": pid,
+                "raw_sim": round(float(raw_sim), 4),
+                "rerank_score": round(rerank_score, 4),
+                "cand_category": cand_cat,
+                "cand_color": cand_color,
+                "cand_pattern": cand_pattern,
+                "category_status": cat_status,
+                "color_status": color_status,
+                "pattern_status": pattern_status,
+                "style_status": style_status,
+                "cat_delta": cat_delta,
+                "color_delta": color_delta,
+                "pattern_delta": pattern_delta,
+                "style_delta": style_delta,
+            }
 
-        Uses multi-crop fusion for scene-level images.
+            scored_candidates.append((pid, float(raw_sim), rerank_score, diag))
 
-        Args:
-            image_input: PIL.Image or numpy.ndarray (RGB)
-            top_k: Number of results to return
-            remove_duplicates: Deduplicate returned product IDs
-
-        Returns:
-            List of (product_id, cosine_similarity) tuples
-        """
-        if isinstance(image_input, np.ndarray):
-            try:
-                if image_input.ndim == 3 and image_input.shape[-1] == 4:
-                    image_input = image_input[:, :, :3]
-                image = Image.fromarray(image_input.astype(np.uint8), "RGB")
-            except Exception as e:
-                logger.warning(f"Could not convert numpy array to PIL Image: {e}")
-                return None
-        elif isinstance(image_input, Image.Image):
-            image = image_input.convert("RGB")
-        else:
-            logger.warning(f"Unsupported image input type: {type(image_input)}")
-            return None
-
-        return self.retrieve_multi_crop(image, top_k=top_k, remove_duplicates=remove_duplicates)
+        # Sort strictly by rerank_score descending
+        scored_candidates.sort(key=lambda x: x[2], reverse=True)
+        return scored_candidates[:top_k]
 
     def retrieve_garments(
         self,
@@ -289,20 +299,10 @@ class SceneRetrieval:
         top_k_per_garment: int = 3,
         remove_duplicates: bool = True,
     ) -> List[Dict]:
-        """Garment-level visual product retrieval.
+        """Garment-level visual product retrieval with category and color reranking.
 
-        Detects garment regions (tops, pants, dresses, footwear, etc.)
-        and retrieves catalog matches for each detected item.
-
-        Returns list of dicts:
-        [{
-            "garment_label": "Top / Shirt",
-            "region": "Upper Body",
-            "box": (x1, y1, x2, y2),
-            "crop_image": PIL.Image,
-            "confidence": float,
-            "recommendations": [(product_id, similarity), ...]
-        }, ...]
+        Extracts anatomically localized garment crops and retrieves category-appropriate
+        catalog recommendations for each detected item.
         """
         if self.catalog_index.get_size() == 0:
             return []
@@ -312,55 +312,101 @@ class SceneRetrieval:
 
         for proposal in garment_proposals:
             crop_img = proposal["image"]
+            query_cat = proposal["label"]
+            query_col = proposal.get("dominant_color", "")
+
+            # Extract fine-grained attributes using attribute_extractor if available
+            query_attrs = proposal.get("attributes")
+            if not query_attrs and hasattr(self.garment_detector, "attribute_extractor") and self.garment_detector.attribute_extractor is not None:
+                query_attrs = self.garment_detector.attribute_extractor.extract_attributes(crop_img)
+            query_pat = proposal.get("pattern") or (query_attrs.get("pattern") if query_attrs else "")
+
             crop_emb = self._encode_pil_image(crop_img)
             if crop_emb is None:
                 continue
 
-            matches = self.retrieve_from_embedding(
-                crop_emb, top_k=top_k_per_garment, remove_duplicates=remove_duplicates
+            # Retrieve candidate pool using category-aware search from catalog_index
+            candidate_pool_size = max(top_k_per_garment * 10, 80)
+            if hasattr(self.catalog_index, "search_candidates"):
+                raw_candidates = self.catalog_index.search_candidates(
+                    crop_emb, target_category=query_cat, candidate_pool_size=candidate_pool_size
+                )
+            else:
+                raw_candidates = self.catalog_index.search(crop_emb, top_k=candidate_pool_size)
+
+            # Deduplicate raw candidates
+            seen = set()
+            deduped_raw = []
+            for pid, sim in raw_candidates:
+                if pid not in seen:
+                    seen.add(pid)
+                    deduped_raw.append((pid, sim))
+
+            # Apply Category, Color, Pattern, and Style Reranking
+            reranked = self.rerank_candidates(
+                raw_candidates=deduped_raw,
+                query_category=query_cat,
+                query_color=query_col,
+                query_pattern=query_pat,
+                query_attributes=query_attrs,
+                top_k=top_k_per_garment,
             )
 
+            # Format final recommendations: (pid, raw_sim, rerank_score) tuples with attached rerank metadata
+            recommendations = [(item[0], item[1], item[2]) for item in reranked]
+            diagnostics = [item[3] for item in reranked]
+
             garment_results.append({
-                "garment_label": proposal["label"],
+                "garment_label": query_cat,
                 "region": proposal["region"],
                 "box": proposal["box"],
                 "crop_image": crop_img,
                 "confidence": proposal["confidence"],
-                "icon": proposal.get("icon", "👕"),
-                "recommendations": matches,
+                "dominant_color": query_col,
+                "pattern": query_pat,
+                "attributes": query_attrs or {},
+                "icon": proposal.get("icon", "🏷️"),
+                "is_uncertain": proposal.get("is_uncertain", False),
+                "recommendations": recommendations,
+                "diagnostics": diagnostics,
             })
 
         return garment_results
 
-    def retrieve_dress(
+    def retrieve_from_image(
         self,
-        scene_image: Image.Image,
-        top_k: int = 5,
+        image_input,
+        top_k: int = 3,
         remove_duplicates: bool = True,
-    ) -> Optional[Dict]:
-        """Specifically detect and retrieve matching catalog products for the dress in the scene."""
-        if self.catalog_index.get_size() == 0:
+    ) -> Optional[List[Tuple[str, float]]]:
+        """Full-scene baseline visual retrieval using multi-crop score fusion."""
+        if isinstance(image_input, np.ndarray):
+            try:
+                if image_input.ndim == 3 and image_input.shape[-1] == 4:
+                    image_input = image_input[:, :, :3]
+                image = Image.fromarray(image_input.astype(np.uint8), "RGB")
+            except Exception:
+                return None
+        elif isinstance(image_input, Image.Image):
+            image = image_input.convert("RGB")
+        else:
             return None
 
-        dress_info = self.garment_detector.detect_dress(scene_image)
-        if not dress_info:
-            return None
+        crops = _generate_scene_crops(image)
+        crop_images = [c[1] for c in crops]
+        embeddings = self._encode_pil_batch(crop_images)
 
-        crop_emb = self._encode_pil_image(dress_info["crop_image"])
-        if crop_emb is None:
-            return None
+        product_best_score: Dict[str, float] = {}
+        for emb in embeddings:
+            if emb is None:
+                continue
+            results = self.catalog_index.search(emb, top_k=top_k * 4)
+            for pid, sim in results:
+                if pid not in product_best_score or sim > product_best_score[pid]:
+                    product_best_score[pid] = sim
 
-        matches = self.retrieve_from_embedding(
-            crop_emb, top_k=top_k, remove_duplicates=remove_duplicates
-        )
-        dress_info["recommendations"] = matches
-        dress_info["icon"] = "👗"
-        return dress_info
+        if not product_best_score:
+            return []
 
-    def batch_retrieve(self, scene_paths: List[Path], top_k: int = 5) -> dict:
-        """Batch retrieve results for multiple scene paths."""
-        results = {}
-        for p in scene_paths:
-            res = self.retrieve_from_scene(p, top_k=top_k)
-            results[str(p)] = res if res is not None else []
-        return results
+        sorted_results = sorted(product_best_score.items(), key=lambda x: x[1], reverse=True)
+        return sorted_results[:top_k]

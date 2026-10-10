@@ -42,7 +42,7 @@ EVAL_RESULTS_JSON = RESULTS_DIR / "evaluation_results.json"
 EVAL_RESULTS_CSV = RESULTS_DIR / "per_scene_evaluation.csv"
 
 # Retrieval configuration
-DEFAULT_TOP_K = 5
+DEFAULT_TOP_K = 3
 MAX_TOP_K = 20
 
 # Validation configuration

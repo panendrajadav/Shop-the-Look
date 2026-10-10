@@ -161,6 +161,173 @@ class ProductIndex:
 
         return results
 
+    def search_candidates(
+        self,
+        query_embedding: np.ndarray,
+        target_category: Optional[str] = None,
+        candidate_pool_size: int = 80,
+    ) -> List[Tuple[str, float]]:
+        """Retrieve candidate products for reranking with category-aware indexing.
+
+        Prioritizes candidates matching target_category and compatible categories,
+        ensuring queries for jackets or t-shirts are not crowded out by boots.
+        """
+        if self.faiss_index is None or len(self.product_ids) == 0:
+            return []
+
+        # If no target category or no metadata, fall back to global FAISS search
+        if not target_category or not self.metadata:
+            return self.search(query_embedding, top_k=candidate_pool_size)
+
+        compatibility_map = {
+            "Jacket / Outerwear": {
+                "preferred": ["Jacket / Outerwear"],
+                "compatible": ["Top / T-shirt"],
+            },
+            "Top / T-shirt": {
+                "preferred": ["Top / T-shirt"],
+                "compatible": ["Jacket / Outerwear"],
+            },
+            "Pants / Trousers": {
+                "preferred": ["Pants / Trousers"],
+                "compatible": ["Skirt"],
+            },
+            "Dress": {
+                "preferred": ["Dress"],
+                "compatible": ["Skirt"],
+            },
+            "Skirt": {
+                "preferred": ["Skirt"],
+                "compatible": ["Pants / Trousers", "Dress"],
+            },
+            "Footwear": {
+                "preferred": ["Footwear"],
+                "compatible": [],
+            },
+            "Bag / Handbag": {
+                "preferred": ["Bag / Handbag"],
+                "compatible": [],
+            },
+        }
+
+        rules = compatibility_map.get(target_category, {"preferred": [target_category], "compatible": []})
+        preferred_cats = set(rules.get("preferred", []))
+        compatible_cats = set(rules.get("compatible", []))
+
+        # Perform inner-product similarity search across the catalog
+        if self.embeddings is not None:
+            if query_embedding.ndim == 1:
+                q_vec = query_embedding.astype(np.float32)
+            else:
+                q_vec = query_embedding[0].astype(np.float32)
+
+            all_sims = self.embeddings @ q_vec
+
+            preferred_items = []
+            compatible_items = []
+            other_items = []
+
+            for idx, sim in enumerate(all_sims):
+                pid = self.product_ids[idx]
+                cat = self.metadata.get(pid, {}).get("category", "")
+                if cat in preferred_cats:
+                    preferred_items.append((pid, float(sim)))
+                elif cat in compatible_cats:
+                    compatible_items.append((pid, float(sim)))
+                else:
+                    other_items.append((pid, float(sim)))
+
+            preferred_items.sort(key=lambda x: x[1], reverse=True)
+            compatible_items.sort(key=lambda x: x[1], reverse=True)
+            other_items.sort(key=lambda x: x[1], reverse=True)
+
+            # Assemble candidate pool: prioritized preferred and compatible items
+            target_quota = min(len(preferred_items), int(candidate_pool_size * 0.70))
+            compat_quota = min(len(compatible_items), int(candidate_pool_size * 0.25))
+
+            candidates = preferred_items[:target_quota] + compatible_items[:compat_quota]
+            remaining = candidate_pool_size - len(candidates)
+            if remaining > 0:
+                extra = preferred_items[target_quota:] + compatible_items[compat_quota:]
+                candidates.extend(extra[:remaining])
+                remaining = candidate_pool_size - len(candidates)
+                if remaining > 0:
+                    candidates.extend(other_items[:remaining])
+
+            return candidates
+
+        return self.search(query_embedding, top_k=candidate_pool_size)
+
+    def search_with_category(
+        self,
+        query_embedding: np.ndarray,
+        target_category: Optional[str] = None,
+        top_k: int = 5,
+        strict_category: bool = False,
+    ) -> List[Tuple[str, float]]:
+        """Search products with category filtering and category-aware prioritization.
+
+        Args:
+            query_embedding: Query embedding vector
+            target_category: Optional target garment category to filter/boost
+            top_k: Number of final results
+            strict_category: If True, only returns exact category matches if available
+
+        Returns:
+            List of (product_id, similarity) tuples
+        """
+        # Retrieve candidate pool using category-aware search
+        candidate_k = min(len(self.product_ids), max(top_k * 8, 60))
+        candidates = self.search_candidates(query_embedding, target_category=target_category, candidate_pool_size=candidate_k)
+
+        if not target_category or not self.metadata:
+            return candidates[:top_k]
+
+        matched_candidates = []
+        compatible_candidates = []
+        other_candidates = []
+
+        compatibility_map = {
+            "Jacket / Outerwear": ["Jacket / Outerwear", "Top / T-shirt"],
+            "Top / T-shirt": ["Top / T-shirt", "Jacket / Outerwear"],
+            "Pants / Trousers": ["Pants / Trousers", "Skirt"],
+            "Skirt": ["Skirt", "Pants / Trousers", "Dress"],
+            "Dress": ["Dress", "Skirt"],
+            "Footwear": ["Footwear"],
+            "Bag / Handbag": ["Bag / Handbag"],
+        }
+        allowed = compatibility_map.get(target_category, [target_category])
+
+        for pid, sim in candidates:
+            item_meta = self.metadata.get(pid, {})
+            cat = item_meta.get("category", "")
+
+            if cat == target_category:
+                matched_candidates.append((pid, sim))
+            elif cat in allowed:
+                compatible_candidates.append((pid, sim))
+            else:
+                other_candidates.append((pid, sim))
+
+        if strict_category:
+            if len(matched_candidates) < top_k and candidate_k < len(self.product_ids):
+                # Full catalog exact match search
+                all_sims = self.embeddings @ (query_embedding.flatten().astype(np.float32))
+                exact_items = [
+                    (self.product_ids[i], float(all_sims[i]))
+                    for i in range(len(self.product_ids))
+                    if self.metadata.get(self.product_ids[i], {}).get("category") == target_category
+                ]
+                exact_items.sort(key=lambda x: x[1], reverse=True)
+                return exact_items[:top_k]
+            return matched_candidates[:top_k]
+
+        combined = matched_candidates + compatible_candidates
+        if len(combined) < top_k:
+            combined = combined + other_candidates
+
+        return combined[:top_k]
+
     def get_metadata(self, product_id: str) -> Optional[dict]:
         """Get metadata for a product."""
         if self.metadata is None:
