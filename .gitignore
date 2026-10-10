@@ -1,0 +1,86 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyCharm
+.idea/
+*.iml
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# IDE
+.DS_Store
+.project
+.pydevproject
+.settings/
+
+# Artifacts - Large generated files
+artifacts/
+!artifacts/.gitkeep
+
+# Cache directories
+.cache/
+*.cache
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+~*
+.~*
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Data files (not the source dataset)
+data/
+!data/.gitkeep
+
+# Test outputs
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Analysis scripts
+analyze_data.py
+test_urls.py
