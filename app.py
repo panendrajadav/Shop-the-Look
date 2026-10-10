@@ -91,18 +91,18 @@ def load_system():
     try:
         index = ProductIndex(PRODUCTS_EMBEDDINGS_FILE, PRODUCTS_METADATA_FILE, PRODUCTS_INDEX_FILE)
         if not index.load():
-            return None, None, None, None, None
+            return None, None, None, None, None, None
 
         encoder = CLIPImageEncoder(model_name=MODEL_NAME, pretrained=PRETRAINED, device=DEVICE)
         downloader = ImageDownloader(IMAGES_DIR)
-        garment_detector = GarmentDetector(clip_encoder=encoder, use_torchvision_detector=False)
+        garment_detector = GarmentDetector(clip_encoder=encoder, use_torchvision_detector=True)
         retrieval = SceneRetrieval(encoder=encoder, catalog_index=index, garment_detector=garment_detector)
         explainer = RecommendationExplainer(catalog_index=index, clip_encoder=encoder)
 
-        return index, encoder, downloader, retrieval, explainer
+        return index, encoder, downloader, retrieval, explainer, garment_detector
     except Exception as e:
         logger.error(f"Error loading system: {e}")
-        return None, None, None, None, None
+        return None, None, None, None, None, None
 
 
 @st.cache_data
@@ -122,7 +122,7 @@ def main():
     st.caption("AI-powered outfit and product discovery from lifestyle scene images using OpenCLIP & FAISS.")
 
     # Load core models
-    index, encoder, downloader, retrieval, explainer = load_system()
+    index, encoder, downloader, retrieval, explainer, garment_detector = load_system()
 
     if index is None:
         st.error(
@@ -139,8 +139,12 @@ def main():
         st.header("⚙️ Configuration")
         mode = st.radio(
             "Discovery Mode",
-            ["Full-Scene Baseline", "Garment-Level Breakdown"],
-            help="Full-scene embeds the whole image. Garment-level detects and isolates individual clothing items."
+            [
+                "👗 Dress & Outfit Detection (Recommended)",
+                "✨ Multi-Garment Breakdown",
+                "🖼️ Full-Scene Baseline",
+            ],
+            help="Dress detection isolates the dress directly. Multi-garment detects all items. Full-scene embeds the whole photo."
         )
 
         top_k = st.slider("Recommendations per item (Top-K)", min_value=1, max_value=MAX_TOP_K, value=DEFAULT_TOP_K)
@@ -149,7 +153,7 @@ def main():
         st.markdown("---")
         st.header("📊 Index Status")
         st.metric("Catalog Products Indexed", f"{index.get_size():,}")
-        st.metric("Visual Embedding Dim", f"{encoder.get_embedding_dim()} (ViT-B-32)")
+        st.metric("Visual Embedding Dim", f"{encoder.get_embedding_dim()} ({MODEL_NAME})")
         st.metric("Inference Hardware", DEVICE.upper())
 
     # Tabs
@@ -209,8 +213,24 @@ def main():
                     except Exception as e:
                         st.error(f"Invalid image file: {e}")
 
+            # Process detections if image is loaded
+            detected_garments = []
             if query_image is not None:
-                st.image(query_image, caption="Query Scene Image", use_container_width=True)
+                if mode in ["👗 Dress & Outfit Detection (Recommended)", "✨ Multi-Garment Breakdown"]:
+                    with st.spinner("AI Model detecting dress & garment regions..."):
+                        detected_garments = retrieval.retrieve_garments(
+                            scene_image=query_image,
+                            top_k_per_garment=top_k,
+                            remove_duplicates=deduplicate
+                        )
+                    if detected_garments:
+                        annotated_img = garment_detector.draw_detections(query_image, detected_garments)
+                        st.image(annotated_img, caption="Query Scene with AI Detected Bounding Boxes", use_container_width=True)
+                    else:
+                        st.image(query_image, caption="Query Scene Image", use_container_width=True)
+                else:
+                    st.image(query_image, caption="Query Scene Image", use_container_width=True)
+
                 if current_scene_id:
                     st.caption(f"**Scene ID:** `{current_scene_id}`")
                     if known_gt_ids:
@@ -222,43 +242,70 @@ def main():
             if query_image is None:
                 st.info("👈 Select or upload a scene image to discover matching catalog products.")
             else:
-                if mode == "Full-Scene Baseline":
-                    with st.spinner("Searching catalog index..."):
-                        results = retrieval.retrieve_from_image(
-                            query_image, top_k=top_k, remove_duplicates=deduplicate
-                        )
+                if mode == "👗 Dress & Outfit Detection (Recommended)":
+                    # Look for dress first
+                    dress_item = next((g for g in detected_garments if g.get("garment_label") == "Dress"), None)
 
-                    if not results:
-                        st.warning("No matches found in the catalog.")
+                    if dress_item:
+                        st.success(f"🎉 **AI Model Accurately Detected Dress** ({dress_item['confidence']:.1%} confidence)")
+                        d_col1, d_col2 = st.columns([1, 2])
+                        with d_col1:
+                            st.image(dress_item["crop_image"], caption="Detected Dress Crop", use_container_width=True)
+                        with d_col2:
+                            st.write(f"**Garment:** 👗 Dress / One-Piece Outfit")
+                            st.write(f"**Region:** {dress_item['region']}")
+                            st.write(f"**Bounding Box:** `{dress_item['box']}`")
+
+                        st.markdown("---")
+                        st.markdown("#### 🛍️ Matching Catalog Dresses")
+                        dress_recs = dress_item.get("recommendations", [])
+                        if not dress_recs:
+                            st.warning("No catalog matches found.")
+                        else:
+                            explanations = explainer.explain_batch(
+                                results=dress_recs,
+                                query_image=dress_item["crop_image"],
+                                ground_truth_ids=known_gt_ids
+                            )
+                            for exp in explanations:
+                                render_product_card(exp)
+
                     else:
-                        st.success(f"Retrieved Top-{len(results)} visually similar products.")
+                        # Fallback: outfit is two-piece separates
+                        st.info("ℹ️ AI Model detected a two-piece outfit (Top & Bottom). Displaying outfit matches:")
+                        if detected_garments:
+                            garment_tabs = st.tabs([f"{g.get('icon', '👕')} {g['garment_label']}" for g in detected_garments])
+                            for tab, g_item in zip(garment_tabs, detected_garments):
+                                with tab:
+                                    st.image(g_item["crop_image"], width=180, caption=f"{g_item['garment_label']} ({g_item['confidence']:.1%})")
+                                    recs = g_item.get("recommendations", [])
+                                    exps = explainer.explain_batch(
+                                        results=recs,
+                                        query_image=g_item["crop_image"],
+                                        ground_truth_ids=known_gt_ids
+                                    )
+                                    for exp in exps:
+                                        render_product_card(exp)
+                        else:
+                            st.warning("No garment regions detected.")
 
-                        explanations = explainer.explain_batch(
-                            results=results,
-                            query_image=query_image,
-                            ground_truth_ids=known_gt_ids
-                        )
-
-                        for exp in explanations:
-                            render_product_card(exp)
-
-                else:
-                    # Garment-Level Breakdown Mode
-                    with st.spinner("Detecting garment regions & retrieving matching items..."):
-                        garment_results = retrieval.retrieve_garments(
-                            scene_image=query_image,
-                            top_k_per_garment=top_k,
-                            remove_duplicates=deduplicate
-                        )
-
-                    if not garment_results:
+                elif mode == "✨ Multi-Garment Breakdown":
+                    if not detected_garments:
                         st.warning("No garment regions could be isolated.")
                     else:
-                        st.success(f"Identified {len(garment_results)} distinct garment regions.")
+                        st.success(f"Identified {len(detected_garments)} distinct garment regions.")
+                        garment_tabs = st.tabs([f"{g.get('icon', '👕')} {g['garment_label']}" for g in detected_garments])
+                        for tab, g_item in zip(garment_tabs, detected_garments):
+                            with tab:
+                                g_col1, g_col2 = st.columns([1, 2])
+                                with g_col1:
+                                    st.image(g_item["crop_image"], caption=f"Crop: {g_item['garment_label']} ({g_item['confidence']:.1%})", use_container_width=True)
+                                with g_col2:
+                                    st.write(f"**Detected Label:** {g_item['garment_label']}")
+                                    st.write(f"**Confidence:** {g_item['confidence']:.1%}")
+                                    st.write(f"**Box Coordinates:** `{g_item['box']}`")
 
-                        for g_idx, g_item in enumerate(garment_results, 1):
-                            with st.expander(f"👕 Item #{g_idx}: {g_item['garment_label']} ({g_item['region']})", expanded=(g_idx==1)):
-                                st.image(g_item["crop_image"], width=160, caption=f"Crop: {g_item['garment_label']} ({g_item['confidence']:.1%})")
+                                st.markdown("##### Matching Catalog Items")
                                 g_recs = g_item["recommendations"]
                                 if not g_recs:
                                     st.write("No catalog items matched this crop.")
@@ -270,6 +317,25 @@ def main():
                                     )
                                     for exp in g_explanations:
                                         render_product_card(exp)
+
+                else:
+                    # Full-Scene Baseline
+                    with st.spinner("Searching catalog index with multi-crop fusion..."):
+                        results = retrieval.retrieve_from_image(
+                            query_image, top_k=top_k, remove_duplicates=deduplicate
+                        )
+
+                    if not results:
+                        st.warning("No matches found in the catalog.")
+                    else:
+                        st.success(f"Retrieved Top-{len(results)} visually similar products.")
+                        explanations = explainer.explain_batch(
+                            results=results,
+                            query_image=query_image,
+                            ground_truth_ids=known_gt_ids
+                        )
+                        for exp in explanations:
+                            render_product_card(exp)
 
     with tab_evaluation:
         st.subheader("Benchmark Metrics on `validation.jsonl`")
@@ -381,7 +447,7 @@ def render_documentation():
     ### Technical Methodology
 
     #### 1. Representation & Embedding Model
-    - **Backbone Architecture:** OpenCLIP ViT-B/32 (Vision Transformer with 32x32 patch size, 512-dimensional output embedding).
+    - **Backbone Architecture:** OpenCLIP **ViT-L/14** (Vision Transformer with 14x14 patch size, 768-dimensional output embedding, DataComp-XL pretrained).
     - **Normalization:** Embeddings are L2-normalized so inner product equals cosine similarity:
       $$\\text{Cosine Similarity}(u, v) = \\frac{u \\cdot v}{\\|u\\| \\|v\\|} = u \\cdot v$$
     - **Inference Optimization:** Batched tensor preprocessing and evaluation across CPU/GPU with thread-safe resource caching.

@@ -200,7 +200,11 @@ class EvaluationPipeline:
         }
 
     def evaluate(self, validation_pairs: List[Dict], scene_to_products: Dict[str, List[str]]) -> Dict:
-        """Run evaluation across validation scenes with thorough data integrity auditing.
+        """Run evaluation across validation scenes with multi-crop fusion.
+
+        Uses multi-crop score fusion to bridge the scene-to-product domain gap:
+        multiple overlapping crops from each scene are encoded, candidates are
+        retrieved for each, and max-score-per-product across crops is used.
 
         Args:
             validation_pairs: List of {"scene": ..., "product": ...} dicts
@@ -209,6 +213,10 @@ class EvaluationPipeline:
         Returns:
             Dict containing evaluation metrics and coverage statistics
         """
+        from PIL import Image
+        from src.retrieval import _generate_scene_crops
+        import torch
+
         self.coverage_stats["total_validation_pairs"] = len(validation_pairs)
         self.coverage_stats["unique_scenes"] = len(scene_to_products)
 
@@ -240,18 +248,41 @@ class EvaluationPipeline:
                 self.coverage_stats["scenes_skipped_no_indexed_gt"] += 1
                 continue
 
-            # 3. Encode scene image
-            scene_emb = self.image_encoder.encode_image(scene_img_path)
-            if scene_emb is None:
+            # 3. Open scene image and generate multi-crops
+            try:
+                scene_image = Image.open(scene_img_path).convert("RGB")
+            except Exception:
                 continue
 
-            # 4. Retrieve top-K candidates from catalog index
-            retrieved = self.catalog_index.search(scene_emb, top_k=max_k)
+            crops = _generate_scene_crops(scene_image)
 
-            # Deduplicate retrieved candidates
+            # 4. Encode all crops and fuse retrieval scores
+            product_best_score = {}
+            for crop_name, crop_img in crops:
+                try:
+                    with torch.no_grad():
+                        tensor = self.image_encoder.preprocess(crop_img).unsqueeze(0).to(self.image_encoder.device)
+                        features = self.image_encoder.model.encode_image(tensor)
+                        features = features / features.norm(dim=-1, keepdim=True)
+                        crop_emb = features.cpu().numpy()[0].astype(np.float32)
+                except Exception:
+                    continue
+
+                retrieved = self.catalog_index.search(crop_emb, top_k=max_k * 3)
+                for pid, sim in retrieved:
+                    if pid not in product_best_score or sim > product_best_score[pid]:
+                        product_best_score[pid] = sim
+
+            if not product_best_score:
+                continue
+
+            # Sort fused results by score
+            sorted_results = sorted(product_best_score.items(), key=lambda x: x[1], reverse=True)
+
+            # Deduplicate
             seen = set()
             deduped = []
-            for pid, sim in retrieved:
+            for pid, sim in sorted_results:
                 if pid not in seen:
                     seen.add(pid)
                     deduped.append((pid, sim))

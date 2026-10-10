@@ -4,15 +4,14 @@ from pathlib import Path
 # Project paths
 PROJECT_ROOT = Path(__file__).parent
 # Dataset directory (check data/ first, fallback to dataset/)
-DATA_DIR = PROJECT_ROOT / "data" if (PROJECT_ROOT / "data" / "product_catelog.jsonl").exists() else PROJECT_ROOT / "dataset"
+DATA_DIR = PROJECT_ROOT / "data"
 ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
-CACHE_DIR = ARTIFACTS_DIR / "cache"
 EMBEDDINGS_DIR = ARTIFACTS_DIR / "embeddings"
 IMAGES_DIR = ARTIFACTS_DIR / "images"
 RESULTS_DIR = ARTIFACTS_DIR / "results"
 
 # Create directories if needed
-for dir_path in [ARTIFACTS_DIR, CACHE_DIR, EMBEDDINGS_DIR, IMAGES_DIR, RESULTS_DIR]:
+for dir_path in [ARTIFACTS_DIR, EMBEDDINGS_DIR, IMAGES_DIR, RESULTS_DIR]:
     dir_path.mkdir(parents=True, exist_ok=True)
 
 # Dataset files

@@ -67,10 +67,6 @@ Thumbs.db
 .DS_Store
 desktop.ini
 
-# Data files (not the source dataset)
-data/
-!data/.gitkeep
-
 # Test outputs
 .pytest_cache/
 htmlcov/
@@ -80,7 +76,3 @@ htmlcov/
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb
-
-# Analysis scripts
-analyze_data.py
-test_urls.py

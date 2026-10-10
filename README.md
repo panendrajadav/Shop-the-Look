@@ -36,15 +36,8 @@ shop-the-look/
 │   ├── explanations.py         # Evidence-grounded visual attribute explanation engine
 │   └── evaluation.py           # Recall@K, MRR, and coverage evaluation pipeline
 ├── scripts/                    # Command-line workflows
-│   ├── inspect_dataset.py      # Dataset schema audit & image URL accessibility verification
 │   ├── build_index.py          # Multithreaded catalog indexing & caching
-│   ├── evaluate.py             # Evaluation runner producing JSON & CSV reports
-│   └── smoke_test.py           # End-to-end component health test
-├── tests/                      # Automated unit test suite (18 tests passing)
-│   ├── test_data_loader.py
-│   ├── test_image_downloader.py
-│   ├── test_retrieval.py
-│   └── test_evaluation.py
+│   └── evaluate.py             # Evaluation runner producing JSON & CSV reports
 └── artifacts/                  # Local storage (excluded from git)
     ├── embeddings/             # FAISS index, numpy vectors, metadata JSON
     ├── images/                 # MD5 sub-structured image cache
@@ -90,25 +83,14 @@ Our data audit script (`scripts/inspect_dataset.py`) verifies the actual dataset
 pip install -r requirements.txt
 ```
 
-### 2. Verify System (Smoke Test)
-```bash
-python scripts/smoke_test.py
-```
-
-### 3. Run Automated Tests
-```bash
-python -m pytest tests/
-```
-*(Runs 18 unit tests covering parsing, downloads, indexing, deduplication, and metrics).*
-
-### 4. Build Catalog Index
+### 2. Build Catalog Index
 To build the catalog index with prioritized ground-truth items and concurrent downloads:
 ```bash
 python scripts/build_index.py --limit 1000
 ```
 *To index the entire 28,094 catalog, pass `--limit 0`.*
 
-### 5. Run Evaluation
+### 3. Run Evaluation
 ```bash
 python scripts/evaluate.py
 ```
@@ -116,7 +98,7 @@ Outputs full metrics to console and writes:
 - `artifacts/results/evaluation_results.json`
 - `artifacts/results/per_scene_evaluation.csv`
 
-### 6. Launch Interactive Web Demo
+### 4. Launch Interactive Web Demo
 ```bash
 streamlit run app.py
 ```
